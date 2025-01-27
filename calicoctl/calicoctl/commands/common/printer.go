@@ -24,12 +24,11 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	log "github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/runtime"
-
 	"github.com/google/safetext/yamltemplate"
 	"github.com/projectcalico/go-json/json"
 	"github.com/projectcalico/go-yaml-wrapper"
+	log "github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/resourcemgr"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
@@ -256,7 +255,13 @@ func config(client client.Interface) func(string) string {
 						asValue = "64512"
 					}
 				} else {
-					asValue = bgpConfig.Spec.ASNumber.String()
+					if bgpConfig.Spec.ASNumber != nil {
+						asValue = bgpConfig.Spec.ASNumber.String()
+					} else {
+						// Use the default ASNumber of 64512 when there is none configured (first ASN reserved for private use).
+						// https://en.m.wikipedia.org/wiki/Autonomous_system_(Internet)#ASN_Table
+						asValue = "64512"
+					}
 				}
 			}
 			return asValue

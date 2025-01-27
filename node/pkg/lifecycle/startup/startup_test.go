@@ -26,12 +26,11 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -109,21 +108,24 @@ var _ = DescribeTable("Node IP detection failure cases",
 		Expect(err).NotTo(HaveOccurred())
 
 		node := libapi.Node{}
-		if rrCId != "" {
+		if networkingBackend != "none" && rrCId != "" {
 			node.Spec.BGP = &libapi.NodeBGPSpec{RouteReflectorClusterID: rrCId}
 		}
 
 		updated := configureAndCheckIPAddressSubnets(context.Background(), c, &node, &v1.Node{})
 		Expect(updated).To(Equal(expectedUpdate))
 		Expect(my_ec).To(Equal(expectedExitCode))
-		if rrCId != "" {
+		if networkingBackend != "none" && rrCId != "" {
 			Expect(node.Spec.BGP).NotTo(BeNil())
+		}
+		if networkingBackend == "none" {
+			Expect(node.Spec.BGP).To(BeNil())
 		}
 	},
 
 	Entry("startup should terminate if IP is set to none and Calico is used for networking", "bird", 1, "", false),
 	Entry("startup should NOT terminate if IP is set to none and Calico is policy-only", "none", 0, "", false),
-	Entry("startup should NOT terminate and BGPSpec shouldn't be set to nil", "none", 0, "rrClusterID", true),
+	Entry("startup should NOT terminate and BGPSpec shouldn't be set", "none", 0, "rrClusterID", false),
 )
 
 var _ = Describe("Default IPv4 pool CIDR", func() {
@@ -472,6 +474,74 @@ var _ = Describe("FV tests against a real etcd", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(poolList.Items).To(BeEmpty(), "Environment %#v", os.Environ())
 	})
+
+	DescribeTable("Test skip pool creation via 'none' CALICO_IPVxPOOL_CIDR env variable values",
+		func(envList []EnvItem, poolsCount int, expectIPV4Pool, expectIPV6Pool bool) {
+			// Create clients for test.
+			cfg, err := apiconfig.LoadClientConfigFromEnvironment()
+			Expect(err).NotTo(HaveOccurred())
+			c, err := client.New(*cfg)
+			Expect(err).NotTo(HaveOccurred())
+			be, err := backend.NewClient(*cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = be.Clean()
+			Expect(err).NotTo(HaveOccurred())
+
+			// Get the IPPool list.
+			poolList, err := c.IPPools().List(ctx, options.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(poolList.Items).To(BeEmpty(), "Environment %#v", os.Environ())
+
+			// Set the env variables specified.
+			for _, env := range envList {
+				os.Setenv(env.key, env.value)
+			}
+			defer func() {
+				for _, env := range envList {
+					os.Unsetenv(env.key)
+				}
+			}()
+
+			// Run the UUT.
+			configureIPPools(ctx, c, kubeadmConfig)
+
+			poolList, err = c.IPPools().List(ctx, options.ListOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(poolList.Items)).To(BeIdenticalTo(poolsCount), "Expected number of default pools")
+
+			// Look through the pool for the expected data.
+			foundv4pool := false
+			foundv6pool := false
+
+			for _, pool := range poolList.Items {
+				if pool.Name == DEFAULT_IPV4_POOL_NAME {
+					foundv4pool = true
+					continue
+				}
+				if pool.Name == DEFAULT_IPV6_POOL_NAME {
+					foundv6pool = true
+					continue
+				}
+			}
+
+			Expect(foundv4pool).To(BeIdenticalTo(expectIPV4Pool),
+				"Expected IPv4 pool is in Pools")
+			Expect(foundv6pool).To(BeIdenticalTo(expectIPV6Pool),
+				"Expected IPv6 pool is in Pools")
+		},
+
+		Entry("CALICO_IPV4POOL_CIDR=none", []EnvItem{
+			{key: "CALICO_IPV4POOL_CIDR", value: "none"},
+		}, 1, false, true),
+		Entry("CALICO_IPV6POOL_CIDR=none", []EnvItem{
+			{key: "CALICO_IPV6POOL_CIDR", value: "none"},
+		}, 1, true, false),
+		Entry("CALICO_IPV4POOL_CIDR=none and CALICO_IPV6POOL_CIDR=none", []EnvItem{
+			{key: "CALICO_IPV4POOL_CIDR", value: "none"},
+			{key: "CALICO_IPV6POOL_CIDR", value: "none"},
+		}, 0, false, false),
+	)
 
 	DescribeTable("Test IP pool env variables that cause exit",
 		func(envList []EnvItem) {

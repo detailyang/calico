@@ -22,16 +22,16 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/logutils"
+	"github.com/projectcalico/calico/felix/proto"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 type Manager struct {
-	// failsafesMap is the BPF map containing host enpodint failsafe ports.
+	// failsafesMap is the BPF map containing host endpoint failsafe ports.
 	failsafesMap maps.Map
 	// failsafesInSync is set to true if the failsafe map is in sync.
 	failsafesInSync bool
@@ -40,7 +40,10 @@ type Manager struct {
 	// failsafesOut the outbound failsafe ports, from configuration.
 	failsafesOut []config.ProtoPort
 
-	opReporter logutils.OpRecorder
+	opReporter   logutils.OpRecorder
+	keyFromSlice func([]byte) KeyInterface
+	makeKey      func(ipProto uint8, port uint16, outbound bool, ip string, mask int) KeyInterface
+	ipFamily     proto.IPVersion
 }
 
 func (m *Manager) OnUpdate(_ interface{}) {
@@ -50,12 +53,18 @@ func NewManager(
 	failsafesMap maps.Map,
 	failsafesIn, failsafesOut []config.ProtoPort,
 	opReporter logutils.OpRecorder,
+	ipFamily proto.IPVersion,
+	keyFromSlice func([]byte) KeyInterface,
+	makeKey func(ipProto uint8, port uint16, outbound bool, ip string, mask int) KeyInterface,
 ) *Manager {
 	return &Manager{
 		failsafesMap: failsafesMap,
 		failsafesIn:  failsafesIn,
 		failsafesOut: failsafesOut,
 		opReporter:   opReporter,
+		keyFromSlice: keyFromSlice,
+		makeKey:      makeKey,
+		ipFamily:     ipFamily,
 	}
 }
 
@@ -70,9 +79,9 @@ func (m *Manager) ResyncFailsafes() error {
 	m.opReporter.RecordOperation("resync-failsafes")
 
 	syncFailed := false
-	unknownKeys := set.New[Key]()
+	unknownKeys := set.New[KeyInterface]()
 	err := m.failsafesMap.Iter(func(rawKey, _ []byte) maps.IteratorAction {
-		key := KeyFromSlice(rawKey)
+		key := m.keyFromSlice(rawKey)
 		unknownKeys.Add(key)
 		return maps.IterNone
 	})
@@ -96,6 +105,9 @@ func (m *Manager) ResyncFailsafes() error {
 		cidr := p.Net
 		if p.Net == "" {
 			cidr = "0.0.0.0/0"
+			if m.ipFamily == proto.IPVersion_IPV6 {
+				cidr = "0::0/0"
+			}
 		}
 		ip, ipnet, err := cnet.ParseCIDROrIP(cidr)
 		if err != nil {
@@ -104,25 +116,22 @@ func (m *Manager) ResyncFailsafes() error {
 			return
 		}
 
-		ipv4 := ip.To4()
-		if ipv4 == nil || len(ipv4) != 4 {
-			// If ipv4 is nil, then the IP is not an IPv4 address. Only IPv4 addresses are supported in failsafes.
-			log.Errorf("Invalid IPv4 address configured in the failsafe ports: %s", cidr)
-			syncFailed = true
+		if ipnet.Version() != int(m.ipFamily) {
 			return
 		}
 
-		mask, bits := ipnet.Mask.Size()
-		if bits != 32 {
-			log.Errorf("CIDR mask size not valid for IPv4 addresses: %d", bits)
-			syncFailed = true
-			return
+		mask, _ := ipnet.Mask.Size()
+		maskedIPStr := ""
+		if m.ipFamily == proto.IPVersion_IPV4 {
+			ipv4 := ip.To4()
+			// Mask the IP
+			maskedIPStr = ipv4.Mask(ipnet.Mask).String()
+		} else {
+			ipv6 := ip.To16()
+			maskedIPStr = ipv6.Mask(ipnet.Mask).String()
 		}
 
-		// Mask the IP
-		maskedIP := ipv4.Mask(ipnet.Mask)
-
-		k := MakeKey(ipProto, p.Port, outbound, maskedIP.String(), mask)
+		k := m.makeKey(ipProto, p.Port, outbound, maskedIPStr, mask)
 		unknownKeys.Discard(k)
 		err = m.failsafesMap.Update(k.ToSlice(), Value())
 		if err != nil {
@@ -140,7 +149,7 @@ func (m *Manager) ResyncFailsafes() error {
 		addPort(p, true)
 	}
 
-	unknownKeys.Iter(func(k Key) error {
+	unknownKeys.Iter(func(k KeyInterface) error {
 		err := m.failsafesMap.Delete(k.ToSlice())
 		if err != nil {
 			log.WithError(err).WithField("key", k).Warn("Failed to remove failsafe port from map.")

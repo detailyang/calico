@@ -12,23 +12,16 @@
 #include <bpf_core_read.h>
 #include <stddef.h>
 #include <linux/ip.h>
-#include "globals.h"
 
+/* CALI_BPF_INLINE must be defined before we include any of our headers. They
+ * assume it exists!
+ */
 #define CALI_BPF_INLINE inline __attribute__((always_inline))
+
+#include "globals.h"
 
 #define BPF_REDIR_EGRESS 0
 #define BPF_REDIR_INGRESS 1
-
-struct bpf_map_def_extended {
-	__u32 type;
-	__u32 key_size;
-	__u32 value_size;
-	__u32 max_entries;
-	__u32 map_flags;
-#if defined(__BPFTOOL_LOADER__)
-	__u32 map_id;
-#endif
-};
 
 /* These constants must be kept in sync with the calculate-flags script. */
 
@@ -59,6 +52,7 @@ struct bpf_map_def_extended {
 #define CALI_XDP_PROG 	(1<<6)
 #define CALI_TC_NAT_IF	(1<<7)
 #define CALI_TC_LO	(1<<8)
+#define CALI_CT_CLEANUP	(1<<9)
 
 #ifndef CALI_DROP_WORKLOAD_TO_HOST
 #define CALI_DROP_WORKLOAD_TO_HOST false
@@ -73,10 +67,11 @@ struct bpf_map_def_extended {
 
 #define CALI_F_HEP     	 ((CALI_COMPILE_FLAGS) & (CALI_TC_HOST_EP | CALI_TC_NAT_IF))
 #define CALI_F_WEP     	 (!CALI_F_HEP)
-#define CALI_F_TUNNEL  	 ((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL)
-#define CALI_F_L3_DEV    ((CALI_COMPILE_FLAGS) & CALI_TC_L3_DEV)
+#define CALI_F_TUNNEL  	 (((CALI_COMPILE_FLAGS) & CALI_TC_TUNNEL) != 0)
+#define CALI_F_L3_DEV    (((CALI_COMPILE_FLAGS) & CALI_TC_L3_DEV) != 0)
 #define CALI_F_NAT_IF    (((CALI_COMPILE_FLAGS) & CALI_TC_NAT_IF) != 0)
 #define CALI_F_LO        (((CALI_COMPILE_FLAGS) & CALI_TC_LO) != 0)
+#define CALI_F_CT_CLEANUP (((CALI_COMPILE_FLAGS) & CALI_CT_CLEANUP) != 0)
 
 #define CALI_F_MAIN	(CALI_F_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF && !CALI_F_LO)
 
@@ -118,6 +113,7 @@ static CALI_BPF_INLINE void __compile_asserts(void) {
 	/* Either CALI_CGROUP is set or the other TC flags */
 	COMPILE_TIME_ASSERT(
 		CALI_COMPILE_FLAGS == 0 ||
+		CALI_F_CT_CLEANUP ||
 		!!(CALI_COMPILE_FLAGS & CALI_CGROUP) !=
 		!!(CALI_COMPILE_FLAGS & (CALI_TC_HOST_EP | CALI_TC_INGRESS | CALI_TC_TUNNEL | CALI_TC_DSR | CALI_XDP_PROG))
 	);
@@ -192,19 +188,24 @@ enum calico_skb_mark {
 	/* CALI_SKB_MARK_SKIP_FIB is used for packets that should pass through host IP stack. */
 	CALI_SKB_MARK_SKIP_FIB               = CALI_SKB_MARK_SEEN | 0x00100000,
 	/* CT_ESTABLISHED is used by iptables to tell the BPF programs that the packet is part of an
-	 * established Linux conntrack flow. This allows the BPF program to let through pre-existing
+	 * established Linux conntrack flow. This allows the BPF program to let through preexisting
 	 * flows at start of day. */
 	CALI_SKB_MARK_CT_ESTABLISHED         = 0x08000000,
 	CALI_SKB_MARK_CT_ESTABLISHED_MASK    = 0x08000000,
 
-       /* CALI_SKB_MARK_TO_NAT_IFACE_OUT signals to routing that this packet should to
-        * to the bpfnatout interface.
-        */
-       CALI_SKB_MARK_TO_NAT_IFACE_OUT        = 0x41000000,
-       /* CALI_SKB_MARK_FROM_NAT_IFACE_OUT signals to the next hop that the packet passed
-	* through bpfnatout so that it can set its conntrack correctly.
-	*/
-       CALI_SKB_MARK_FROM_NAT_IFACE_OUT      = 0x81000000,
+	CALI_SKB_MARK_RESERVED                = 0x11000000,
+	/* CALI_SKB_MARK_RELATED_RESOLVED mean it is related traffic, we already
+	 * know that and we have resolved NAT etc.
+	 */
+	CALI_SKB_MARK_RELATED_RESOLVED        = 0x21000000,
+	/* CALI_SKB_MARK_TO_NAT_IFACE_OUT signals to routing that this packet should to
+	 * to the bpfnatout interface.
+	 */
+	CALI_SKB_MARK_TO_NAT_IFACE_OUT        = 0x41000000,
+	/* CALI_SKB_MARK_FROM_NAT_IFACE_OUT signals to the next hop that the packet passed
+	 * through bpfnatout so that it can set its conntrack correctly.
+	 */
+	CALI_SKB_MARK_FROM_NAT_IFACE_OUT      = 0x81000000,
 
 };
 
@@ -226,8 +227,32 @@ static CALI_BPF_INLINE __attribute__((noreturn)) void bpf_exit(int rc) {
 }
 #pragma clang diagnostic pop
 
+#ifdef IPVER6
+
+#ifdef BPF_CORE_SUPPORTED
+#define IP_FMT "[%pI6]"
+#define debug_ip(ip) (&(ip))
+#else
+#define debug_ip(ip) (bpf_htonl((ip).d))
+#endif
+#define ip_is_dnf(ip) (true)
+
+#else
+
+#ifdef BPF_CORE_SUPPORTED
+#define IP_FMT "%pI4"
+#define debug_ip(ip) (&(ip))
+#else
+#define debug_ip(ip) bpf_htonl(ip)
+#endif
+
 #define ip_is_dnf(ip) ((ip)->frag_off & bpf_htons(0x4000))
 #define ip_frag_no(ip) ((ip)->frag_off & bpf_htons(0x1fff))
+#endif
+
+#ifndef IP_FMT
+#define IP_FMT "%x"
+#endif
 
 static CALI_BPF_INLINE void ip_dec_ttl(struct iphdr *ip)
 {
@@ -240,35 +265,51 @@ static CALI_BPF_INLINE void ip_dec_ttl(struct iphdr *ip)
 	ip->check = (__be16) (sum + (sum >> 16));
 }
 
+#ifdef IPVER6
+#define ip_ttl_exceeded(ip) (CALI_F_TO_HOST && !CALI_F_TUNNEL && (ip)->hop_limit <= 1)
+#else
 #define ip_ttl_exceeded(ip) (CALI_F_TO_HOST && !CALI_F_TUNNEL && (ip)->ttl <= 1)
+#endif
 
 #if CALI_F_XDP
 
-extern const volatile struct cali_xdp_globals __globals;
+extern const volatile struct cali_xdp_preamble_globals __globals;
 #define CALI_CONFIGURABLE(name) 1 /* any value will do, it is not configured */
+#define CALI_CONFIGURABLE_IP(name) 1
 
-#elif (!CALI_F_CGROUP) || defined(UNITTEST)
+#elif !CALI_F_CGROUP || defined(UNITTEST)
 
-extern const volatile struct cali_tc_globals __globals;
-#define CALI_CONFIGURABLE(name) ctx->globals->name
+#if CALI_F_CT_CLEANUP
+extern const volatile struct cali_ct_cleanup_globals __globals;
+#else
+extern const volatile struct cali_tc_preamble_globals __globals;
+#endif
 
+#define CALI_CONFIGURABLE(name) ctx->globals->data.name
+#ifdef IPVER6
+#define CALI_CONFIGURABLE_IP(name) CALI_CONFIGURABLE(name)
+#else
+#define CALI_CONFIGURABLE_IP(name) ctx->globals->data.name.a
+#endif
 #else
 
 #define CALI_CONFIGURABLE(name) 1 /* any value will do, it is not configured */
+#define CALI_CONFIGURABLE_IP(name) 1
 
 #endif /* loader */
 
-#define HOST_IP		CALI_CONFIGURABLE(host_ip)
+#define HOST_IP		CALI_CONFIGURABLE_IP(host_ip)
 #define TUNNEL_MTU 	CALI_CONFIGURABLE(tunnel_mtu)
 #define VXLAN_PORT 	CALI_CONFIGURABLE(vxlan_port)
-#define INTF_IP		CALI_CONFIGURABLE(intf_ip)
+#define INTF_IP		CALI_CONFIGURABLE_IP(intf_ip)
 #define EXT_TO_SVC_MARK	CALI_CONFIGURABLE(ext_to_svc_mark)
 #define PSNAT_START	CALI_CONFIGURABLE(psnat_start)
 #define PSNAT_LEN	CALI_CONFIGURABLE(psnat_len)
 #define GLOBAL_FLAGS 	CALI_CONFIGURABLE(flags)
-#define HOST_TUNNEL_IP	CALI_CONFIGURABLE(host_tunnel_ip)
+#define HOST_TUNNEL_IP	CALI_CONFIGURABLE_IP(host_tunnel_ip)
 #define WG_PORT		CALI_CONFIGURABLE(wg_port)
 #define NATIN_IFACE	CALI_CONFIGURABLE(natin_idx)
+#define PROFILING	CALI_CONFIGURABLE(profiling)
 
 #ifdef UNITTEST
 #define CALI_PATCH_DEFINE(name, pattern)							\
@@ -286,25 +327,25 @@ CALI_PATCH_DEFINE(__skb_mark, 0x4d424b53) /* be 0x4d424b53 = ASCII(SKBM) */
 
 #define map_symbol(name, ver) name##ver
 
-#define MAP_LOOKUP_FN(name, ver) \
-static CALI_BPF_INLINE void * name##_lookup_elem(const void* key)	\
+#define MAP_LOOKUP_FN(fname, name, ver) \
+static CALI_BPF_INLINE void * fname##_lookup_elem(const void* key)	\
 {									\
 	return bpf_map_lookup_elem(&map_symbol(name, ver), key);	\
 }
 
-#define MAP_UPDATE_FN(name, ver) \
-static CALI_BPF_INLINE int name##_update_elem(const void* key, const void* value, __u64 flags)\
+#define MAP_UPDATE_FN(fname, name, ver) \
+static CALI_BPF_INLINE int fname##_update_elem(const void* key, const void* value, __u64 flags)\
 {										\
 	return bpf_map_update_elem(&map_symbol(name, ver), key, value, flags);	\
 }
 
-#define MAP_DELETE_FN(name, ver) \
-static CALI_BPF_INLINE int name##_delete_elem(const void* key)	\
+#define MAP_DELETE_FN(fname, name, ver) \
+static CALI_BPF_INLINE int fname##_delete_elem(const void* key)	\
 {									\
 	return bpf_map_delete_elem(&map_symbol(name, ver), key);	\
 }
 
-#define CALI_MAP(name, ver,  map_type, key_type, val_type, size, flags)			\
+#define CALI_MAP_NAMED(name, fname, ver,  map_type, key_type, val_type, size, flags)		\
 struct {										\
 	__uint(type, map_type);								\
 	__type(key, key_type);								\
@@ -312,13 +353,26 @@ struct {										\
 	__uint(max_entries, size);							\
 	__uint(map_flags, flags);							\
 }map_symbol(name, ver) SEC(".maps");							\
-	MAP_LOOKUP_FN(name, ver)							\
-	MAP_UPDATE_FN(name, ver)							\
-	MAP_DELETE_FN(name, ver)
+	MAP_LOOKUP_FN(fname, name, ver)							\
+	MAP_UPDATE_FN(fname, name, ver)							\
+	MAP_DELETE_FN(fname, name, ver)
+
+#define CALI_MAP(name, ver, map_type, key_type, val_type, size, flags)			\
+		CALI_MAP_NAMED(name, name, ver,  map_type, key_type, val_type, size, flags)
 
 #define CALI_MAP_V1(name, map_type, key_type, val_type, size, flags)			\
 		CALI_MAP(name,, map_type, key_type, val_type, size, flags)
 
 char ____license[] __attribute__((section("license"), used)) = "GPL";
+
+#define NEXTHDR_HOP		0
+#define NEXTHDR_ROUTING		43
+#define NEXTHDR_FRAGMENT	44
+#define NEXTHDR_GRE		47
+#define NEXTHDR_ESP		50
+#define NEXTHDR_AUTH		51
+#define NEXTHDR_NONE		59
+#define NEXTHDR_DEST		60
+#define NEXTHDR_MOBILITY	135
 
 #endif /* __CALI_BPF_H__ */

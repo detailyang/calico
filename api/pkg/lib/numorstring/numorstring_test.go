@@ -21,7 +21,6 @@ import (
 
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 )
 
@@ -159,7 +158,7 @@ func init() {
 	)
 
 	// Perform tests of Protocols FromString method.
-	DescribeTable("NumOrStringProtocols FromString is not case sensitive",
+	DescribeTable("NumOrStringProtocols FromString is not case-sensitive",
 		func(input, expected string) {
 			Expect(numorstring.ProtocolFromString(input).StrVal).To(Equal(expected),
 				"expected parsed protocol to match")

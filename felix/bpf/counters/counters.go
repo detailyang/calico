@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	MaxCounterNumber    int = 14
+	MaxCounterNumber    int = 17
 	counterMapKeySize   int = 8
 	counterMapValueSize int = 8
 )
@@ -67,11 +67,15 @@ const (
 	DroppedShortPacket
 	DroppedFailedCSUM
 	DroppedIPOptions
-	DroppredIPMalformed
+	DroppedIPMalformed
 	DroppedFailedEncap
 	DroppedFailedDecap
 	DroppedUnauthSource
 	DroppedUnknownRoute
+	DroppedBlackholeRoute
+	SourceCollisionHit
+	SourceCollisionResolutionFailed
+	ConntrackCreateFailed
 )
 
 type Description struct {
@@ -131,7 +135,7 @@ var descriptions DescList = DescList{
 		Category: "Dropped", Caption: "packets with unsupported IP options",
 	},
 	{
-		Counter:  DroppredIPMalformed,
+		Counter:  DroppedIPMalformed,
 		Category: "Dropped", Caption: "malformed IP packets",
 	},
 	{
@@ -149,6 +153,22 @@ var descriptions DescList = DescList{
 	{
 		Counter:  DroppedUnknownRoute,
 		Category: "Dropped", Caption: "packets with unknown route",
+	},
+	{
+		Counter:  DroppedBlackholeRoute,
+		Category: "Dropped", Caption: "packets hitting blackhole route",
+	},
+	{
+		Counter:  SourceCollisionHit,
+		Category: "Other", Caption: "packets hitting NAT source collision",
+	},
+	{
+		Counter:  ConntrackCreateFailed,
+		Category: "Dropped", Caption: "failed to create conntrack",
+	},
+	{
+		Counter:  SourceCollisionResolutionFailed,
+		Category: "Dropped", Caption: "NAT source collision resolution failed",
 	},
 }
 

@@ -15,6 +15,7 @@
 package etcd
 
 import (
+	"context"
 	"math/rand"
 	"net"
 	"strconv"
@@ -23,7 +24,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client/v2"
 	etcd "go.etcd.io/etcd/client/v2"
-	"golang.org/x/net/context"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -80,7 +80,7 @@ func newSyncer(keysAPI etcd.KeysAPI, callbacks api.SyncerCallbacks) *etcdSyncer 
 // # The merge goroutine
 //
 // The merge goroutine receives updates about newly loaded snapshots (from the
-// snapshot reeading goroutine) and events (from the watcher goroutine) and
+// snapshot reading goroutine) and events (from the watcher goroutine) and
 // merges them into a consistent event stream.
 //
 // Since processing a snapshot takes some time and it happens concurrently with

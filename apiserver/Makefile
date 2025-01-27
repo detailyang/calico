@@ -1,7 +1,7 @@
 include ../metadata.mk
 
 PACKAGE_NAME = github.com/projectcalico/calico/apiserver
-LOCAL_CHECKS     = lint-cache-dir goimports
+LOCAL_CHECKS     = lint-cache-dir
 
 # Used so semaphore commits generated files when pins are updated
 EXTRA_FILES_TO_COMMIT=*_generated.go *_generated.*.go
@@ -11,8 +11,7 @@ EXTRA_FILES_TO_COMMIT=*_generated.go *_generated.*.go
 API_SERVER_IMAGE      ?=apiserver
 BUILD_IMAGES          ?=$(API_SERVER_IMAGE)
 
-EXTRA_DOCKER_ARGS += -e GOLANGCI_LINT_CACHE=/lint-cache -v $(CURDIR)/.lint-cache:/lint-cache:rw \
-				 -v $(CURDIR)/../hack/boilerplate:/go/src/k8s.io/kubernetes/hack/boilerplate:rw
+EXTRA_DOCKER_ARGS += -v $(CURDIR)/../hack/boilerplate:/go/src/k8s.io/kubernetes/hack/boilerplate:rw
 
 ###############################################################################
 BINDIR ?= bin
@@ -58,7 +57,7 @@ include ../lib.Makefile
 
 FIPS ?= false
 
-ifeq ($(FIPS), true)
+ifeq ($(FIPS),true)
 CONTAINER_MARKER=$(CONTAINER_FIPS_CREATED)
 VALIDARCHES=amd64
 BINDIR=bin/$(ARCH)-fips
@@ -67,49 +66,23 @@ CONTAINER_MARKER=$(CONTAINER_CREATED)
 BINDIR=bin
 endif
 
-# Use ARCH specific build image.
-CALICO_BUILD:=$(CALICO_BUILD)-$(ARCH)
-
 ###############################################################################
-# Static checks
-###############################################################################
-## Perform static checks on the code.
-# TODO: re-enable these linters !
-LINT_ARGS := --disable gosimple,govet,structcheck,errcheck,goimports,unused,ineffassign,staticcheck,deadcode,typecheck --timeout 5m
-
-###############################################################################
-# CI/CD
-###############################################################################
-.PHONY: ci
-## Run what CI runs
-ci: clean static-checks image ut fv
-
-## Deploys images to registry
-cd: image-all cd-common
-
 # This section builds the output binaries.
 # Some will have dedicated targets to make it easier to type, for example
 # "apiserver" instead of "$(BINDIR)/apiserver".
-#########################################################################
+###############################################################################
 $(BINDIR)/apiserver-$(ARCH): $(K8SAPISERVER_GO_FILES)
-ifeq ($(ARCH),amd64)
-ifeq ($(FIPS), true)
+ifeq ($(FIPS),true)
 	$(call build_cgo_boring_binary, $(PACKAGE_NAME)/cmd/apiserver, $@)
 else
 	$(call build_binary, $(PACKAGE_NAME)/cmd/apiserver, $@)
 endif
-else
-	$(DOCKER_RUN) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD) \
-		sh -c '$(GIT_CONFIG_SSH) go build -v -o $@ -ldflags "$(VERSION_FLAGS)" $(PACKAGE_NAME)/cmd/apiserver'
-endif
-
-$(BINDIR)/filecheck-$(ARCH): $(K8SAPISERVER_GO_FILES)
-	$(call build_binary, $(PACKAGE_NAME)/cmd/filecheck, $@)
 
 ###############################################################################
 # Building the image
 ###############################################################################
-build: image
+.PHONY: build
+build: $(BINDIR)/apiserver-$(ARCH)
 
 CONTAINER_CREATED=.apiserver.created-$(ARCH)
 CONTAINER_FIPS_CREATED=.apiserver.created-$(ARCH)-fips
@@ -122,25 +95,20 @@ sub-image-%:
 sub-image-fips-%:
 	$(MAKE) image FIPS=true ARCH=$*
 
-$(API_SERVER_IMAGE): register $(CONTAINER_MARKER)
-$(CONTAINER_CREATED): docker-image/Dockerfile.$(ARCH) $(BINDIR)/apiserver-$(ARCH) $(BINDIR)/filecheck-$(ARCH)
-	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(API_SERVER_IMAGE):latest-$(ARCH) -f docker-image/Dockerfile.$(ARCH) . --load
+$(API_SERVER_IMAGE): $(CONTAINER_MARKER)
+$(CONTAINER_CREATED): Dockerfile $(BINDIR)/apiserver-$(ARCH)
+	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(API_SERVER_IMAGE):latest-$(ARCH) -f Dockerfile .
 	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
 	touch $@
 
-$(CONTAINER_FIPS_CREATED): docker-image/Dockerfile.$(ARCH) $(BINDIR)/apiserver-$(ARCH) $(BINDIR)/filecheck-$(ARCH)
-	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(API_SERVER_IMAGE):latest-fips-$(ARCH) -f docker-image/Dockerfile.$(ARCH) . --load
+$(CONTAINER_FIPS_CREATED): Dockerfile $(BINDIR)/apiserver-$(ARCH)
+	$(DOCKER_BUILD) --build-arg BIN_DIR=$(BINDIR) -t $(API_SERVER_IMAGE):latest-fips-$(ARCH) -f Dockerfile .
 	$(MAKE) FIPS=true retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest-fips LATEST_IMAGE_TAG=latest-fips
 	touch $@
 
 .PHONY: lint-cache-dir
 lint-cache-dir:
 	mkdir -p $(CURDIR)/.lint-cache
-
-check-boring-ssl: $(BINDIR)/apiserver-$(ARCH)
-	$(DOCKER_RUN) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD) \
-		go tool nm $(BINDIR)/apiserver-$(ARCH) > $(BINDIR)/tags.txt && grep '_Cfunc__goboringcrypto_' $(BINDIR)/tags.txt 1> /dev/null
-	-rm -f $(BINDIR)/tags.txt
 
 .PHONY: ut
 ut: lint-cache-dir run-etcd
@@ -156,7 +124,7 @@ st:
 check-copyright:
 	@../hack/check-copyright.sh
 
-GITHUB_TEST_INTEGRATION_URI := https://raw.githubusercontent.com/kubernetes/kubernetes/$(KUBECTL_VERSION)/hack/lib
+GITHUB_TEST_INTEGRATION_URI := https://raw.githubusercontent.com/kubernetes/kubernetes/$(K8S_VERSION)/hack/lib
 
 hack-lib:
 	mkdir -p hack/lib/
@@ -175,7 +143,7 @@ run-kubernetes-server: run-k8s-controller-manager
 		--rm \
 		-v  $(CURDIR):/manifests \
 		-v $(CERTS_PATH):/home/user/certs \
-		bitnami/kubectl:$(subst v,,$(KUBECTL_VERSION)) \
+		bitnami/kubectl:$(subst v,,$(K8S_VERSION)) \
 		--kubeconfig=/home/user/certs/kubeconfig \
 		apply -f /manifests/test/mock-node.yaml
 
@@ -186,7 +154,7 @@ run-kubernetes-server: run-k8s-controller-manager
 		--rm \
 		-v  $(CURDIR):/manifests \
 		-v $(CERTS_PATH):/home/user/certs \
-		bitnami/kubectl:$(subst v,,$(KUBECTL_VERSION)) \
+		bitnami/kubectl:$(subst v,,$(K8S_VERSION)) \
 		--kubeconfig=/home/user/certs/kubeconfig \
 		apply -f /manifests/test/namespaces.yaml
 
@@ -222,8 +190,7 @@ clean: clean-bin clean-hack-lib
 	find . -name '.*.created*' -type f -delete
 	find . -name '.*.published*' -type f -delete
 	rm -rf .lint-cache
-	docker rmi $(API_SERVER_IMAGE):latest-$(ARCH) || true
-	docker rmi $(API_SERVER_IMAGE):latest-fips-$(ARCH) || true
+	-docker image rm -f $$(docker images $(API_SERVER_IMAGE) -a -q)
 
 clean-bin:
 	rm -rf $(BINDIR) \
@@ -231,6 +198,16 @@ clean-bin:
 
 clean-hack-lib:
 	rm -rf hack/lib/
+
+###############################################################################
+# CI/CD
+###############################################################################
+.PHONY: ci
+## Run what CI runs
+ci: clean static-checks image ut fv
+
+## Deploys images to registry
+cd: image-all cd-common
 
 ###############################################################################
 # Release
@@ -245,16 +222,6 @@ release-build: .release-$(VERSION).created
 	$(MAKE) FIPS=true retag-build-images-with-registries IMAGETAG=$(VERSION)-fips RELEASE=true LATEST_IMAGE_TAG=latest-fips
 	$(MAKE) FIPS=true retag-build-images-with-registries IMAGETAG=latest-fips RELEASE=true LATEST_IMAGE_TAG=latest-fips
 	touch $@
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	if ! docker run calico/apiserver | grep 'Version:\s*$(VERSION)$$'; then \
-	  echo "Reported version:" `docker run calico/apiserver` "\nExpected version: $(VERSION)"; \
-	  false; \
-	else \
-	  echo "Version check passed\n"; \
-	fi
 
 ## Pushes a github release and release artifacts produced by `make release-build`.
 release-publish: release-prereqs .release-$(VERSION).published

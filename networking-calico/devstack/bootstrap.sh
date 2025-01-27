@@ -16,6 +16,11 @@
 
 set -ex
 
+sudo pip uninstall -y setuptools
+sudo rm -rf /usr/local/lib/python3.8/dist-packages/setuptools-*.dist-info
+sudo find / -name "*setuptools*" || true
+sudo pip list || true
+
 #------------------------------------------------------------------------------
 # IMPORTANT - Review before use!
 #
@@ -74,6 +79,19 @@ set -ex
 #
 # ------------------------------------------------------------------------------
 
+# Handle branch name transition from "stable/yoga" to "unmaintained/yoga".  The DevStack repo
+# internally still uses "stable/yoga" for all its defaults even though all the actual branch names
+# have changed to "unmaintained/yoga".
+if [ "${DEVSTACK_BRANCH}" = unmaintained/yoga ]; then
+    export CINDER_BRANCH=unmaintained/yoga
+    export GLANCE_BRANCH=unmaintained/yoga
+    export KEYSTONE_BRANCH=unmaintained/yoga
+    export NEUTRON_BRANCH=unmaintained/yoga
+    export NOVA_BRANCH=unmaintained/yoga
+    export PLACEMENT_BRANCH=unmaintained/yoga
+    export REQUIREMENTS_BRANCH=unmaintained/yoga
+fi
+
 : ${NC_PLUGIN_REPO:=https://github.com/projectcalico/calico}
 : ${NC_PLUGIN_REF:=master}
 
@@ -117,6 +135,10 @@ LOG_COLOR=False
 
 TEMPEST_BRANCH=29.1.0
 
+# Setting to prevent DevStack from configuring a value of dhcp_client that old Tempest code does not
+# support.
+SCENARIO_IMAGE_TYPE=ignore
+
 # We clone from GitHub because we commonly used to hit GnuTLS errors when git cloning OpenStack
 # repos from opendev.org (which is the default server), for example:
 #
@@ -154,15 +176,32 @@ cd ..
 sudo mkdir -p /opt/stack
 sudo mv devstack /opt/stack
 sudo chown -R stack:stack /opt/stack
-ls -la /opt/stack
+ls -ld /home/
+ls -la /home/
+ls -la /home/semaphore/
+ls -la /home/semaphore/calico
+
+# Allow the stack user to read /home/semaphore.  In the ubuntu2204 image on Semaphore,
+# /home/semaphore permissions are "drwxr-x---", which it means it can't be read by users outside the
+# "semaphore" group.
+sudo adduser stack semaphore
 
 # Stack!
 sudo -u stack -H -E bash -x <<'EOF'
-
-set
+ls -la /home/semaphore/calico
+ls -ld /opt/stack
+ls -la /opt/stack
 cd /opt/stack/devstack
+export FORCE=yes
 ./stack.sh
+EOF
 
+# We use a fresh `sudo -u stack -H -E bash ...` invocation here, because with
+# OpenStack Yoga it appears there is something in the stack.sh setup that
+# closes stdin, and that means that bash doesn't read any further commands from
+# stdin after the exit of the ./stack.sh line.
+sudo -u stack -H -E bash -x <<'EOF'
+cd /opt/stack/devstack
 if ! ${TEMPEST:-false}; then
     if [ x${SERVICE_HOST:-$HOSTNAME} = x$HOSTNAME ]; then
         # We're not running Tempest tests, and we're on the controller node.

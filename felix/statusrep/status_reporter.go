@@ -31,7 +31,6 @@ type EndpointStatusReporter struct {
 	hostname           string
 	region             string
 	endpointUpdates    <-chan interface{}
-	inSync             <-chan bool
 	stop               chan bool
 	datastore          datastore
 	epStatusIDToStatus map[model.Key]string
@@ -48,7 +47,6 @@ type EndpointStatusReporter struct {
 func NewEndpointStatusReporter(hostname string,
 	region string,
 	endpointUpdates <-chan interface{},
-	inSync <-chan bool,
 	datastore datastore,
 	reportingDelay time.Duration,
 	resyncInterval time.Duration) *EndpointStatusReporter {
@@ -60,7 +58,6 @@ func NewEndpointStatusReporter(hostname string,
 		hostname,
 		region,
 		endpointUpdates,
-		inSync,
 		datastore,
 		resyncSchedulingTicker,
 		resyncSchedulingTicker.C,
@@ -76,7 +73,6 @@ func NewEndpointStatusReporter(hostname string,
 func newEndpointStatusReporterWithTickerChans(hostname string,
 	region string,
 	endpointUpdates <-chan interface{},
-	inSync <-chan bool,
 	datastore datastore,
 	resyncTicker stoppable,
 	resyncTickerChan <-chan time.Time,
@@ -89,11 +85,10 @@ func newEndpointStatusReporterWithTickerChans(hostname string,
 		region:             region,
 		endpointUpdates:    endpointUpdates,
 		datastore:          datastore,
-		inSync:             inSync,
 		stop:               make(chan bool),
 		epStatusIDToStatus: make(map[model.Key]string),
-		queuedDirtyIDs:     set.NewBoxed[model.Key](),
-		activeDirtyIDs:     set.NewBoxed[model.Key](),
+		queuedDirtyIDs:     set.New[model.Key](),
+		activeDirtyIDs:     set.New[model.Key](),
 		resyncTicker:       resyncTicker,
 		resyncTickerC:      resyncTickerChan,
 		rateLimitTicker:    rateLimitTicker,
@@ -136,6 +131,8 @@ func (esr *EndpointStatusReporter) loopHandlingEndpointStatusUpdates() {
 loop:
 	for {
 		updatesAllowed := false
+
+	selectUpdates:
 		select {
 		case <-esr.stop:
 			log.Info("Stopping endpoint status reporter")
@@ -147,9 +144,6 @@ loop:
 			resyncRequested = true
 		case <-esr.rateLimitTickerC:
 			updatesAllowed = true
-		case inSync := <-esr.inSync:
-			log.Debug("Datamodel in sync, enabling status resync")
-			datamodelInSync = datamodelInSync || inSync
 		case msg := <-esr.endpointUpdates:
 			var statID model.Key
 			var status string
@@ -182,6 +176,9 @@ loop:
 					Hostname:   esr.hostname,
 					EndpointID: msg.Id.EndpointId,
 				}
+			case *proto.DataplaneInSync:
+				datamodelInSync = true
+				break selectUpdates
 			default:
 				log.Panicf("Unexpected message: %#v", msg)
 			}
@@ -248,7 +245,7 @@ loop:
 					esr.activeDirtyIDs.Add(item)
 					return nil
 				})
-				esr.queuedDirtyIDs = set.NewBoxed[model.Key]()
+				esr.queuedDirtyIDs = set.New[model.Key]()
 			}
 		}
 	}
@@ -334,7 +331,7 @@ func (esr *EndpointStatusReporter) writeEndpointStatus(ctx context.Context, epID
 		logCxt.Info("Deleting endpoint status")
 		_, err = esr.datastore.Delete(ctx, epID, "")
 		if _, ok := err.(errors.ErrorResourceDoesNotExist); ok {
-			// Ignore non-existent resource.
+			// Ignore nonexistent resource.
 			err = nil
 		}
 	}

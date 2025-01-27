@@ -25,6 +25,15 @@ func New[T comparable]() Typed[T] {
 	return make(Typed[T])
 }
 
+func NewSize[T comparable](size int) Typed[T] {
+	return make(Typed[T], size)
+}
+
+// Empty returns a read-only set with no members.  Calls to Add etc. panic.
+func Empty[T comparable]() Typed[T] {
+	return (Typed[T])(nil)
+}
+
 func From[T comparable](members ...T) Typed[T] {
 	s := New[T]()
 	s.AddAll(members)
@@ -83,9 +92,7 @@ func (set Typed[T]) Discard(item T) {
 }
 
 func (set Typed[T]) Clear() {
-	for item := range set {
-		delete(set, item)
-	}
+	clear(set)
 }
 
 func (set Typed[T]) Contains(item T) bool {

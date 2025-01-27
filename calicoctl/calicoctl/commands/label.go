@@ -20,13 +20,12 @@ import (
 	"strings"
 
 	docopt "github.com/docopt/docopt-go"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/common"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/constants"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/resourcemgr"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
-
-	log "github.com/sirupsen/logrus"
 )
 
 func Label(args []string) error {
@@ -60,10 +59,10 @@ Options:
      --overwrite               If true, overwrite the value when the key is already
                                present in labels. Otherwise reports error when the
                                labeled resource already have the key in its labels.
-                               Can not be used with --remove.
+                               Cannot be used with --remove.
      --remove                  If true, remove the specified key in labels of the
                                resource. Reports error when specified key does not
-                               exist. Can not be used with --overwrite.
+                               exist. Cannot be used with --overwrite.
      --context=<context>       The name of the kubeconfig context to use.
      --allow-version-mismatch  Allow client and cluster versions mismatch.
 
@@ -71,21 +70,8 @@ Description:
   The label command is used to add or update a label on a resource. Resource types
   that can be labeled are:
 
-    * bgpConfiguration
-    * bgpPeer
-    * felixConfiguration
-    * globalNetworkPolicy
-    * globalNetworkSet
-    * hostEndpoint
-    * ipPool
-    * ipReservation
-    * kubeControllersConfiguration
-    * networkPolicy
-    * node
-    * profile
-    * workloadEndpoint
-
-  The resource type is case insensitive and may be pluralized.
+<RESOURCE_LIST>
+  The resource type is case-insensitive and may be pluralized.
 
   Attempting to label resources that do not exist will get an error.
 
@@ -98,6 +84,9 @@ Description:
 	// Replace all instances of BINARY_NAME with the name of the binary.
 	binaryName, _ := util.NameAndDescription()
 	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", binaryName)
+
+	// Replace <RESOURCE_LIST> with the list of resource types.
+	doc = strings.Replace(doc, "<RESOURCE_LIST>", util.Resources(), 1)
 
 	parsedArgs, err := docopt.ParseArgs(doc, args, "")
 	if err != nil {
@@ -156,7 +145,7 @@ Description:
 		_, ok := labels[key]
 		if !ok {
 			// raise error if the key does not exist.
-			return fmt.Errorf("can not remove label of %s %s, key %s does not exist",
+			return fmt.Errorf("cannot remove label of %s %s, key %s does not exist",
 				kind, name, key)
 		} else {
 			delete(labels, key)

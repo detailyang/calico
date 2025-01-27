@@ -120,6 +120,11 @@ class FakePlugin(object):
 
     get_networks = None
 
+    # New method required sometime between Yoga and Caracal releases - see
+    # https://github.com/projectcalico/calico/issues/9216 for discussion.
+    def get_ports(self, port_filters):
+        return None
+
 
 def empty_network(network_id=NETWORK_ID):
     """Construct and return an empty network model."""
@@ -200,7 +205,7 @@ class MTUWatcher(object):
                 time.sleep(0.5)
 
             if not exited_event.ready():
-                # Now run 'ip link', to find MTU of all pre-existing interfaces.
+                # Now run 'ip link', to find MTU of all preexisting interfaces.
                 self.process_command(['ip', 'link'])
 
             # Wait for the 'ip monitor link' thread to exit, so that we

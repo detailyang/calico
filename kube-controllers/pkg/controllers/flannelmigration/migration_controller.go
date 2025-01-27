@@ -74,7 +74,7 @@ var (
 type flannelMigrationController struct {
 	ctx          context.Context
 	informer     cache.Controller
-	indexer      cache.Indexer
+	indexer      cache.Store
 	calicoClient client.Interface
 	k8sClientset *kubernetes.Clientset
 
@@ -113,7 +113,13 @@ func NewFlannelMigrationController(ctx context.Context, k8sClientset *kubernetes
 	}
 
 	// Informer handles managing the watch and signals us when nodes are added.
-	mc.indexer, mc.informer = cache.NewIndexerInformer(listWatcher, &v1.Node{}, 0, handlers, cache.Indexers{})
+	mc.indexer, mc.informer = cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: listWatcher,
+		ObjectType:    &v1.Node{},
+		ResyncPeriod:  0,
+		Handler:       handlers,
+		Indexers:      cache.Indexers{},
+	})
 
 	return mc
 }
@@ -272,7 +278,7 @@ func (c *flannelMigrationController) processNewNode(node *v1.Node) {
 // but at the same time migration controller restart itself.
 func (c *flannelMigrationController) readAndUpdateFlannelEnvConfig() error {
 	// Work out the Flannel config by kubectl exec into daemonset pod on controller node.
-	log.Infof("Trying to read Flannel env config by executing into daemonet pod.")
+	log.Infof("Trying to read Flannel env config by executing into daemonset pod.")
 	var podLabel map[string]string
 	if c.config.IsRunningCanal() {
 		podLabel = canalPodLabel

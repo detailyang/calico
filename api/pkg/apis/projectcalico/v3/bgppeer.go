@@ -15,11 +15,9 @@
 package v3
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	k8sv1 "k8s.io/api/core/v1"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	k8sv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
@@ -97,7 +95,7 @@ type BGPPeerSpec struct {
 	// restart timeout.  When not specified, the BIRD default of 120s is used.
 	MaxRestartTime *metav1.Duration `json:"maxRestartTime,omitempty"`
 	// Maximum number of local AS numbers that are allowed in the AS path for received routes.
-	// This removes BGP loop prevention and should only be used if absolutely necesssary.
+	// This removes BGP loop prevention and should only be used if absolutely necessary.
 	// +optional
 	NumAllowedLocalASNumbers *int32 `json:"numAllowedLocalASNumbers,omitempty"`
 	// TTLSecurity enables the generalized TTL security mechanism (GTSM) which protects against spoofed packets by
@@ -120,7 +118,7 @@ type SourceAddress string
 
 const (
 	SourceAddressUseNodeIP SourceAddress = "UseNodeIP"
-	SourceAddressNone                    = "None"
+	SourceAddressNone      SourceAddress = "None"
 )
 
 // BGPPassword contains ways to specify a BGP password.

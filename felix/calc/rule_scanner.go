@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,24 +11,24 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package calc
 
 import (
 	"fmt"
-
-	log "github.com/sirupsen/logrus"
+	"strings"
 
 	"github.com/projectcalico/api/pkg/lib/numorstring"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
-	"github.com/projectcalico/calico/libcalico-go/lib/selector"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/labelindex"
 	"github.com/projectcalico/calico/felix/multidict"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/hash"
+	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/selector"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 // AllSelector is a pre-calculated copy of the "all()" selector.
@@ -73,9 +73,9 @@ type RuleScanner struct {
 	ipSetsByUID map[string]*IPSetData
 	// rulesIDToUIDs maps from policy/profile ID to the set of IP set UIDs that are
 	// referenced by that policy/profile.
-	rulesIDToUIDs multidict.IfaceToString
+	rulesIDToUIDs multidict.Multidict[any, string]
 	// uidsToRulesIDs maps from IP set UID to the set of policy/profile IDs that use it.
-	uidsToRulesIDs multidict.StringToIface
+	uidsToRulesIDs multidict.Multidict[string, any]
 
 	OnIPSetActive   func(ipSet *IPSetData)
 	OnIPSetInactive func(ipSet *IPSetData)
@@ -88,6 +88,7 @@ type IPSetData struct {
 	// port, set selector to AllSelector.  If NamedPortProtocol == ProtocolNone then
 	// this IP set represents a selector only, with no named port component.
 	Selector selector.Selector
+
 	// NamedPortProtocol identifies the protocol (TCP or UDP) for a named port IP set.  It is
 	// set to ProtocolNone for a selector-only IP set.
 	NamedPortProtocol labelindex.IPSetPortProtocol
@@ -102,6 +103,24 @@ type IPSetData struct {
 	// cachedUID holds the calculated unique ID of this IP set, or "" if it hasn't been calculated
 	// yet.
 	cachedUID string
+}
+
+func (d *IPSetData) String() string {
+	var parts []string
+	if d.Selector != nil {
+		parts = append(parts, fmt.Sprintf("selector:%q", d.Selector.String()))
+	}
+	if d.NamedPort != "" {
+		parts = append(parts, fmt.Sprintf("namedPort:%s(%s)", d.NamedPort, d.NamedPortProtocol.String()))
+	}
+	if d.Service != "" {
+		parts = append(parts, fmt.Sprintf("service:%q", d.Service))
+	}
+	if d.ServiceIncludePorts {
+		parts = append(parts, "serviceIncludePorts=true")
+	}
+	parts = append(parts, fmt.Sprintf("uniqueID:%q", d.UniqueID()))
+	return "IPSetData{" + strings.Join(parts, ", ") + "}"
 }
 
 func (d *IPSetData) UniqueID() string {
@@ -146,33 +165,47 @@ func (d *IPSetData) DataplaneProtocolType() proto.IPSetUpdate_IPSetType {
 func NewRuleScanner() *RuleScanner {
 	calc := &RuleScanner{
 		ipSetsByUID:    make(map[string]*IPSetData),
-		rulesIDToUIDs:  multidict.NewIfaceToString(),
-		uidsToRulesIDs: multidict.NewStringToIface(),
+		rulesIDToUIDs:  multidict.New[any, string](),
+		uidsToRulesIDs: multidict.New[string, any](),
 	}
 	return calc
 }
 
 func (rs *RuleScanner) OnProfileActive(key model.ProfileRulesKey, profile *model.ProfileRules) {
-	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false, false, "")
+	parsedRules := rs.updateRules(key, profile.InboundRules, profile.OutboundRules, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnProfileActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnProfileInactive(key model.ProfileRulesKey) {
-	rs.updateRules(key, nil, nil, false, false, "")
+	rs.updateRules(key, nil, nil, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnProfileInactive(key)
 }
 
 func (rs *RuleScanner) OnPolicyActive(key model.PolicyKey, policy *model.Policy) {
-	parsedRules := rs.updateRules(key, policy.InboundRules, policy.OutboundRules, policy.DoNotTrack, policy.PreDNAT, policy.Namespace)
+	parsedRules := rs.updateRules(
+		key,
+		policy.InboundRules,
+		policy.OutboundRules,
+		policy.DoNotTrack,
+		policy.PreDNAT,
+		policy.Namespace,
+		selector.Normalise(policy.Selector),
+	)
 	rs.RulesUpdateCallbacks.OnPolicyActive(key, parsedRules)
 }
 
 func (rs *RuleScanner) OnPolicyInactive(key model.PolicyKey) {
-	rs.updateRules(key, nil, nil, false, false, "")
+	rs.updateRules(key, nil, nil, false, false, "", "")
 	rs.RulesUpdateCallbacks.OnPolicyInactive(key)
 }
 
-func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Rule, untracked, preDNAT bool, origNamespace string) (parsedRules *ParsedRules) {
+func (rs *RuleScanner) updateRules(
+	key interface{},
+	inbound, outbound []model.Rule,
+	untracked, preDNAT bool,
+	origNamespace string,
+	origSelector string,
+) (parsedRules *ParsedRules) {
 	log.Debugf("Scanning rules (%v in, %v out) for key %v",
 		len(inbound), len(outbound), key)
 	// Extract all the new selectors/named ports.
@@ -200,11 +233,12 @@ func (rs *RuleScanner) updateRules(key interface{}, inbound, outbound []model.Ru
 		}
 	}
 	parsedRules = &ParsedRules{
-		Namespace:     origNamespace,
-		InboundRules:  parsedInbound,
-		OutboundRules: parsedOutbound,
-		Untracked:     untracked,
-		PreDNAT:       preDNAT,
+		Namespace:        origNamespace,
+		InboundRules:     parsedInbound,
+		OutboundRules:    parsedOutbound,
+		Untracked:        untracked,
+		PreDNAT:          preDNAT,
+		OriginalSelector: origSelector,
 	}
 
 	// Figure out which IP sets are new.
@@ -275,6 +309,8 @@ type ParsedRules struct {
 
 	// PreDNAT is true if these rules should be applied before any DNAT.
 	PreDNAT bool
+
+	OriginalSelector string
 }
 
 // ParsedRule is like a backend.model.Rule, except the selector matches and named ports are
@@ -384,12 +420,16 @@ func ruleToParsedRule(rule *model.Rule) (parsedRule *ParsedRule, allIPSets []*IP
 	// by the selector above.  If we have numeric ports, we can't make the optimization
 	// because we can't filter numeric ports by selector in the same way.
 	var srcSelIPSets, dstSelIPSets []*IPSetData
+
 	if len(srcNumericPorts) > 0 || len(srcNamedPorts) == 0 {
 		srcSelIPSets = selectorsToIPSets(srcSel)
 	}
 	if len(dstNumericPorts) > 0 || len(dstNamedPorts) == 0 {
 		dstSelIPSets = selectorsToIPSets(dstSel)
 	}
+
+	notSrcSelIPSets := selectorsToIPSets(notSrcSels)
+	notDstSelIPSets := selectorsToIPSets(notDstSels)
 
 	// Include any Service IPSet as well.
 	var dstIPPortSets []*IPSetData
@@ -402,9 +442,6 @@ func ruleToParsedRule(rule *model.Rule) (parsedRule *ParsedRule, allIPSets []*IP
 		svc := fmt.Sprintf("%s/%s", rule.SrcServiceNamespace, rule.SrcService)
 		srcSelIPSets = append(srcSelIPSets, &IPSetData{Service: svc, ServiceIncludePorts: false})
 	}
-
-	notSrcSelIPSets := selectorsToIPSets(notSrcSels)
-	notDstSelIPSets := selectorsToIPSets(notDstSels)
 
 	parsedRule = &ParsedRule{
 		Action: rule.Action,
@@ -476,6 +513,7 @@ func ruleToParsedRule(rule *model.Rule) (parsedRule *ParsedRule, allIPSets []*IP
 	return
 }
 
+// Converts a list of named ports to a list of IPSets.
 func namedPortsToIPSets(namedPorts []string, positiveSelectors []selector.Selector, proto labelindex.IPSetPortProtocol) []*IPSetData {
 	var ipSets []*IPSetData
 	if len(positiveSelectors) > 1 {
@@ -497,6 +535,7 @@ func namedPortsToIPSets(namedPorts []string, positiveSelectors []selector.Select
 	return ipSets
 }
 
+// Converts a list of selectors to a list of IPSets.
 func selectorsToIPSets(selectors []selector.Selector) []*IPSetData {
 	var ipSets []*IPSetData
 	for _, s := range selectors {
@@ -507,6 +546,7 @@ func selectorsToIPSets(selectors []selector.Selector) []*IPSetData {
 	return ipSets
 }
 
+// Converts a list of IPSets to a list of their unique IDs.
 func ipSetsToUIDs(ipSets []*IPSetData) []string {
 	var ids []string
 	for _, ipSet := range ipSets {

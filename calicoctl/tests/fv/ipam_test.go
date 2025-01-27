@@ -1,4 +1,4 @@
-// Copyright (c) 2019,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,17 +26,15 @@ import (
 
 	. "github.com/onsi/gomega"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 
 	ipamcmd "github.com/projectcalico/calico/calicoctl/calicoctl/commands/ipam"
 	. "github.com/projectcalico/calico/calicoctl/tests/fv/utils"
 	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
@@ -45,8 +43,8 @@ import (
 )
 
 func init() {
-	log.AddHook(logutils.ContextHook{})
-	log.SetFormatter(&logutils.Formatter{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("test")
 }
 
 func TestIPAM(t *testing.T) {
@@ -211,6 +209,14 @@ func TestIPAMCleanup(t *testing.T) {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(out).To(ContainSubstring("Calico version set to"))
 
+		kcc := v3.NewKubeControllersConfiguration()
+		kcc.Name = "default"
+		kcc.Spec = v3.KubeControllersConfigurationSpec{Controllers: v3.ControllersConfig{
+			LoadBalancer: &v3.LoadBalancerControllerConfig{AssignIPs: v3.AllServices},
+		}}
+		_, err = client.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+
 		// Create an IPv4 pool.
 		pool := v3.NewIPPool()
 		pool.Name = "ipam-test-v4-handle-clean"
@@ -257,7 +263,7 @@ func TestIPAMCleanup(t *testing.T) {
 		createLeakedHandle()
 
 		// Run calicoctl ipam check and parse the resulting report.
-		out = Calicoctl(kdd, "ipam", "check", "--show-all-ips", "-o", "/tmp/ipam_report.json")
+		out = Calicoctl(kdd, "ipam", "check", "--show-all-ips", "-o", "/tmp/ipam_report.json", "--kubeconfig", "/go/src/github.com/projectcalico/calico/calicoctl/test-data/kubeconfig.yaml")
 		t.Log("IPAM check output:", out)
 		reportFile, err := os.ReadFile("/tmp/ipam_report.json")
 		Expect(err).NotTo(HaveOccurred())

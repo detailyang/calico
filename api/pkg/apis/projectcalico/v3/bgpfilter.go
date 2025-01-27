@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,36 +62,72 @@ type BGPFilterSpec struct {
 
 // BGPFilterRuleV4 defines a BGP filter rule consisting a single IPv4 CIDR block and a filter action for this CIDR.
 type BGPFilterRuleV4 struct {
-	CIDR string `json:"cidr" validate:"required,netv4"`
+	CIDR string `json:"cidr,omitempty" validate:"omitempty,netv4"`
 
-	MatchOperator BGPFilterMatchOperator `json:"matchOperator" validate:"required,matchOperator"`
+	PrefixLength *BGPFilterPrefixLengthV4 `json:"prefixLength,omitempty" validate:"omitempty"`
+
+	Source BGPFilterMatchSource `json:"source,omitempty" validate:"omitempty,oneof=RemotePeers"`
+
+	Interface string `json:"interface,omitempty" validate:"omitempty,bgpFilterInterface"`
+
+	MatchOperator BGPFilterMatchOperator `json:"matchOperator,omitempty" validate:"omitempty,matchOperator"`
 
 	Action BGPFilterAction `json:"action" validate:"required,filterAction"`
 }
 
 // BGPFilterRuleV6 defines a BGP filter rule consisting a single IPv6 CIDR block and a filter action for this CIDR.
 type BGPFilterRuleV6 struct {
-	CIDR string `json:"cidr" validate:"required,netv6"`
+	CIDR string `json:"cidr,omitempty" validate:"omitempty,netv6"`
 
-	MatchOperator BGPFilterMatchOperator `json:"matchOperator" validate:"required,matchOperator"`
+	PrefixLength *BGPFilterPrefixLengthV6 `json:"prefixLength,omitempty" validate:"omitempty"`
+
+	Source BGPFilterMatchSource `json:"source,omitempty" validate:"omitempty,oneof=RemotePeers"`
+
+	Interface string `json:"interface,omitempty" validate:"omitempty,bgpFilterInterface"`
+
+	MatchOperator BGPFilterMatchOperator `json:"matchOperator,omitempty" validate:"omitempty,matchOperator"`
 
 	Action BGPFilterAction `json:"action" validate:"required,filterAction"`
 }
+
+type BGPFilterPrefixLengthV4 struct {
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=32
+	Min *int32 `json:"min,omitempty" validate:"omitempty,bgpFilterPrefixLengthV4"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=32
+	Max *int32 `json:"max,omitempty" validate:"omitempty,bgpFilterPrefixLengthV4"`
+}
+
+type BGPFilterPrefixLengthV6 struct {
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=128
+	Min *int32 `json:"min,omitempty" validate:"omitempty,bgpFilterPrefixLengthV6"`
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=128
+	Max *int32 `json:"max,omitempty" validate:"omitempty,bgpFilterPrefixLengthV6"`
+}
+
+type BGPFilterMatchSource string
+
+const (
+	BGPFilterSourceRemotePeers BGPFilterMatchSource = "RemotePeers"
+)
 
 type BGPFilterMatchOperator string
 
 const (
 	Equal    BGPFilterMatchOperator = "Equal"
-	NotEqual                        = "NotEqual"
-	In                              = "In"
-	NotIn                           = "NotIn"
+	NotEqual BGPFilterMatchOperator = "NotEqual"
+	In       BGPFilterMatchOperator = "In"
+	NotIn    BGPFilterMatchOperator = "NotIn"
 )
 
 type BGPFilterAction string
 
 const (
 	Accept BGPFilterAction = "Accept"
-	Reject                 = "Reject"
+	Reject BGPFilterAction = "Reject"
 )
 
 // New BGPFilter creates a new (zeroed) BGPFilter struct with the TypeMetadata

@@ -15,6 +15,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -71,22 +72,8 @@ Description:
 
   Valid resource types are:
 
-    * bgpConfiguration
-    * bgpPeer
-    * felixConfiguration
-    * globalNetworkPolicy
-    * globalNetworkSet
-    * hostEndpoint
-    * ipPool
-    * ipReservation
-    * kubeControllersConfiguration
-    * networkPolicy
-    * networkSet
-    * node
-    * profile
-    * workloadEndpoint
-
-  The resource type is case insensitive and may be pluralized.
+<RESOURCE_LIST>
+  The resource type is case-insensitive and may be pluralized.
 
   Attempting to delete a resource that does not exists is treated as a
   terminating error unless the --skip-not-exists flag is set.  If this flag is
@@ -107,6 +94,9 @@ Description:
 	// Replace all instances of BINARY_NAME with the name of the binary.
 	name, _ := util.NameAndDescription()
 	doc = strings.ReplaceAll(doc, "<BINARY_NAME>", name)
+
+	// Replace <RESOURCE_LIST> with the list of resource types.
+	doc = strings.Replace(doc, "<RESOURCE_LIST>", util.Resources(), 1)
 
 	parsedArgs, err := docopt.ParseArgs(doc, args, "")
 	if err != nil {
@@ -149,7 +139,7 @@ Description:
 				errStr += fmt.Sprintf("Failed to delete resource: %v\n", err)
 			}
 		}
-		return fmt.Errorf(errStr)
+		return errors.New(errStr)
 	}
 
 	return nil

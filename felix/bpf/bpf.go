@@ -38,7 +38,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
-	"github.com/projectcalico/calico/felix/bpf/hook"
+	"github.com/projectcalico/calico/felix/bpf/libbpf"
+	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/utils"
 	"github.com/projectcalico/calico/felix/environment"
 	"github.com/projectcalico/calico/felix/labelindex"
@@ -384,7 +385,70 @@ type getnextEntry struct {
 type mapEntry struct {
 	Key   []string `json:"key"`
 	Value []string `json:"value"`
-	Err   string   `json:"error"`
+}
+
+func (me *mapEntry) UnmarshalJSON(data []byte) error {
+	type entry struct {
+		Key   []string `json:"key"`
+		Value any      `json:"value"`
+	}
+
+	if string(data) == "null" {
+		return nil
+	}
+
+	var e entry
+	err := json.Unmarshal(data, &e)
+	if err != nil {
+		// bad json
+		return err
+	}
+
+	v, ok := e.Value.([]any)
+	if !ok {
+		// the value is not what it should be, likely an error like the entry is
+		// now missing (race) so we just ignore it. It is still a valid json.
+		// Return an empty entry which we will filter out.
+		return nil
+	}
+
+	hexbytes := make([]string, len(v))
+	for i, x := range v {
+		hexbytes[i] = x.(string)
+	}
+
+	*me = mapEntry{
+		Key:   e.Key,
+		Value: hexbytes,
+	}
+
+	return nil
+}
+
+type hexMap []mapEntry
+
+func (hm *hexMap) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+
+	var m []mapEntry
+	err := json.Unmarshal(data, &m)
+	if err != nil {
+		return err
+	}
+
+	var res hexMap
+
+	for _, v := range m {
+		if len(v.Key) != 0 {
+			res = append(res, v)
+		}
+	}
+
+	*hm = res
+
+	return nil
 }
 
 type perCpuMapEntry []struct {
@@ -396,12 +460,36 @@ type perCpuMapEntry []struct {
 }
 
 type ProgInfo struct {
-	Name   string `json:"name"`
-	Id     int    `json:"id"`
-	Type   string `json:"type"`
-	Tag    string `json:"tag"`
-	MapIds []int  `json:"map_ids"`
-	Err    string `json:"error"`
+	Name   string      `json:"name"`
+	Id     int         `json:"id"`
+	Type   BPFProgType `json:"type"`
+	Tag    string      `json:"tag"`
+	MapIds []int       `json:"map_ids"`
+	Err    string      `json:"error"`
+}
+
+// BPFProgType is usually a string, but if the type is not known to bpftool, it
+// would be represented by an int. We do not care about those, but we must not
+// fail on parsing them.
+type BPFProgType string
+
+func (t *BPFProgType) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" || string(data) == `""` || len(data) < 1 {
+		return nil
+	}
+
+	if data[0] == '"' {
+		var s string
+		err := json.Unmarshal(data, &s)
+		if err != nil {
+			return fmt.Errorf("cannot parse json output: %v\n%s", err, data)
+		}
+		*t = BPFProgType(s)
+		return nil
+	}
+
+	*t = BPFProgType(data)
+	return nil
 }
 
 type cgroupProgEntry struct {
@@ -438,7 +526,7 @@ func getMapStructGeneral(mapDesc []string) (*mapInfo, error) {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if m.Err != "" {
-		return nil, fmt.Errorf("%s", m.Err)
+		return nil, errors.New(m.Err)
 	}
 	return &m, nil
 }
@@ -476,7 +564,7 @@ func (b *BPFLib) DumpFailsafeMap() ([]ProtoPort, error) {
 		return nil, fmt.Errorf("failed to dump map (%s): %s\n%s", mapPath, err, output)
 	}
 
-	l := []mapEntry{}
+	l := hexMap{}
 	err = json.Unmarshal(output, &l)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -563,9 +651,6 @@ func (b *BPFLib) LookupFailsafeMap(proto uint8, port uint16) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
-	if l.Err != "" {
-		return false, fmt.Errorf("%s", l.Err)
-	}
 
 	return true, err
 }
@@ -608,9 +693,6 @@ func (b *BPFLib) LookupCIDRMap(ifName string, family IPFamily, ip net.IP, mask i
 	err = json.Unmarshal(output, &l)
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
-	}
-	if l.Err != "" {
-		return 0, fmt.Errorf("%s", l.Err)
 	}
 
 	val, err := hexToCIDRMapValue(l.Value)
@@ -681,7 +763,7 @@ func (b *BPFLib) DumpCIDRMap(ifName string, family IPFamily) (map[CIDRMapKey]uin
 		return nil, fmt.Errorf("failed to dump in map (%s): %s\n%s", mapName, err, output)
 	}
 
-	var al []mapEntry
+	var al hexMap
 	err = json.Unmarshal(output, &al)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -970,7 +1052,7 @@ func (b *BPFLib) GetXDPTag(ifName string) (string, error) {
 		return "", fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return "", fmt.Errorf("%s", p.Err)
+		return "", errors.New(p.Err)
 	}
 
 	return p.Tag, nil
@@ -1060,7 +1142,7 @@ func (b *BPFLib) GetMapsFromXDP(ifName string) ([]int, error) {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return nil, fmt.Errorf("%s", p.Err)
+		return nil, errors.New(p.Err)
 	}
 
 	return p.MapIds, nil
@@ -1266,6 +1348,11 @@ func CidrToHex(cidr string) ([]string, error) {
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		return nil, fmt.Errorf("IP %q is not IPv4", ip)
+	}
+
+	// Check bounds on the mask since the mask will be in CIDR notation and should range between 0 and 32
+	if mask > 32 || mask < 0 {
+		return nil, fmt.Errorf("mask %d should be between 0 and 32", mask)
 	}
 
 	maskBytes := make([]byte, 4)
@@ -1580,7 +1667,7 @@ func (b *BPFLib) getSockMapID(progID int) (int, error) {
 		return -1, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
 	}
 	if p.Err != "" {
-		return -1, fmt.Errorf("%s", p.Err)
+		return -1, errors.New(p.Err)
 	}
 
 	for _, mapID := range p.MapIds {
@@ -1631,7 +1718,7 @@ func clearSockmap(mapArgs []string) error {
 		}
 
 		if e.Err != "" {
-			return fmt.Errorf("%s", e.Err)
+			return errors.New(e.Err)
 		}
 
 		keyArgs := jsonKeyToArgs(e.NextKey)
@@ -1991,7 +2078,7 @@ func (b *BPFLib) DumpSockmapEndpointsMap(family IPFamily) ([]CIDRMapKey, error) 
 		return nil, fmt.Errorf("failed to dump in map (%s): %s\n%s", sockmapEndpointsMapName, err, output)
 	}
 
-	var al []mapEntry
+	var al hexMap
 	err = json.Unmarshal(output, &al)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
@@ -2047,9 +2134,6 @@ func (b *BPFLib) LookupSockmapEndpointsMap(ip net.IP, mask int) (bool, error) {
 	err = json.Unmarshal(output, &l)
 	if err != nil {
 		return false, fmt.Errorf("cannot parse json output: %v\n%s", err, output)
-	}
-	if l.Err != "" {
-		return false, fmt.Errorf("%s", l.Err)
 	}
 
 	return true, err
@@ -2164,7 +2248,7 @@ func PolicyDebugJSONFileName(iface, polDir string, ipFamily proto.IPVersion) str
 	return path.Join(RuntimePolDir, fmt.Sprintf("%s_%s_v%d.json", iface, polDir, ipFamily))
 }
 
-func MapPinDir(typ int, name, iface string, h hook.Hook) string {
+func MapPinDir() string {
 	PinBaseDir := path.Join(bpfdefs.DefaultBPFfsPath, "tc")
 	subDir := "globals"
 	return path.Join(PinBaseDir, subDir)
@@ -2220,7 +2304,7 @@ func ListTcXDPAttachedProgs(dev ...string) (TcList, XDPList, error) {
 
 // IterMapCmdOutput iterates over the output of a command obtained by DumpMapCmd
 func IterMapCmdOutput(output []byte, f func(k, v []byte)) error {
-	var mp []mapEntry
+	var mp hexMap
 	err := json.Unmarshal(output, &mp)
 	if err != nil {
 		return fmt.Errorf("cannot parse json output: %w\n%s", err, output)
@@ -2265,4 +2349,68 @@ func IterPerCpuMapCmdOutput(output []byte, f func(k, v []byte)) error {
 		f(k, v)
 	}
 	return nil
+}
+
+func LoadObject(file string, data libbpf.GlobalData, mapsToBePinned ...string) (*libbpf.Obj, error) {
+	obj, err := libbpf.OpenObject(file)
+	if err != nil {
+		return nil, err
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			err := obj.Close()
+			if err != nil {
+				log.WithError(err).Error("Error closing BPF object.")
+			}
+		}
+	}()
+
+	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
+		// In case of global variables, libbpf creates an internal map <prog_name>.rodata
+		// The values are read only for the BPF programs, but can be set to a value from
+		// userspace before the program is loaded.
+		mapName := m.Name()
+		if m.IsMapInternal() {
+			if strings.HasPrefix(mapName, ".rodata") {
+				continue
+			}
+
+			if err := data.Set(m); err != nil {
+				return nil, fmt.Errorf("failed to configure %s: %w", file, err)
+			}
+			continue
+		}
+
+		if size := maps.Size(mapName); size != 0 {
+			if err := m.SetSize(size); err != nil {
+				return nil, fmt.Errorf("error resizing map %s: %w", mapName, err)
+			}
+		}
+
+		log.Debugf("Pinning map %s k %d v %d", mapName, m.KeySize(), m.ValueSize())
+		pinDir := MapPinDir()
+		// If mapsToBePinned is not specified, pin all the maps.
+		if len(mapsToBePinned) == 0 {
+			if err := m.SetPinPath(path.Join(pinDir, mapName)); err != nil {
+				return nil, fmt.Errorf("error pinning map %s k %d v %d: %w", mapName, m.KeySize(), m.ValueSize(), err)
+			}
+		} else {
+			for _, name := range mapsToBePinned {
+				if mapName == name {
+					if err := m.SetPinPath(path.Join(pinDir, mapName)); err != nil {
+						return nil, fmt.Errorf("error pinning map %s k %d v %d: %w", mapName, m.KeySize(), m.ValueSize(), err)
+					}
+				}
+			}
+		}
+	}
+
+	if err := obj.Load(); err != nil {
+		return nil, fmt.Errorf("error loading program: %w", err)
+	}
+
+	success = true
+	return obj, nil
 }

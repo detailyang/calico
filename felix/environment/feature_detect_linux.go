@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,9 +29,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
-	"github.com/projectcalico/calico/felix/netlinkshim"
-
 	"github.com/projectcalico/calico/felix/iptables/cmdshim"
+	"github.com/projectcalico/calico/felix/netlinkshim"
 )
 
 var (
@@ -50,6 +49,10 @@ var (
 	v3Dot10Dot0 = MustParseVersion("3.10.0")
 	// v3Dot14Dot0 added the random-fully feature on the iptables interface.
 	v3Dot14Dot0 = MustParseVersion("3.14.0")
+	// v4Dot8Dot0 adds support for NFLog size.
+	v4Dot8Dot0 = MustParseVersion("4.8.0")
+	// v5Dot7Dot0 contains a fix for checksum offloading.
+	v5Dot7Dot0 = MustParseVersion("5.7.0")
 	// v5Dot14Dot0 is the fist kernel version that IPIP tunnels acts like other L3
 	// devices where bpf programs only see inner IP header. In RHEL based distros,
 	// kernel 4.18.0 (v4Dot18Dot0_330) is the first one with this behavior.
@@ -58,6 +61,8 @@ var (
 )
 
 type FeatureDetector struct {
+	featureDetectorCommon
+
 	lock            sync.Mutex
 	featureCache    *Features
 	featureOverride map[string]string
@@ -113,7 +118,7 @@ func (d *FeatureDetector) RefreshFeatures() {
 
 func (d *FeatureDetector) refreshFeaturesLockHeld() {
 	// Get the versions.  If we fail to detect a version for some reason, we use a safe default.
-	log.Debug("Refreshing detected iptables features")
+	log.Debug("Refreshing detected dataplane features")
 
 	iptV := d.getIptablesVersion()
 	kerV := d.getKernelVersion()
@@ -128,9 +133,10 @@ func (d *FeatureDetector) refreshFeaturesLockHeld() {
 		SNATFullyRandom:          iptV.Compare(v1Dot6Dot0) >= 0 && kerV.Compare(v3Dot14Dot0) >= 0,
 		MASQFullyRandom:          iptV.Compare(v1Dot6Dot2) >= 0 && kerV.Compare(v3Dot14Dot0) >= 0,
 		RestoreSupportsLock:      iptV.Compare(v1Dot6Dot2) >= 0,
-		ChecksumOffloadBroken:    true, // Was supposed to be fixed in v5.7 but still seems to be broken.
+		ChecksumOffloadBroken:    kerV.Compare(v5Dot7Dot0) <= 0,
 		IPIPDeviceIsL3:           d.ipipDeviceIsL3(),
 		KernelSideRouteFiltering: netlinkSupportsStrict,
+		NFLogSize:                kerV.Compare(v4Dot8Dot0) >= 0,
 	}
 
 	for k, v := range d.featureOverride {
@@ -420,6 +426,10 @@ type FakeFeatureDetector struct {
 	Features
 }
 
+func (f *FakeFeatureDetector) FeatureGate(name string) string {
+	return ""
+}
+
 func (f *FakeFeatureDetector) RefreshFeatures() {
 }
 
@@ -429,4 +439,3 @@ func (f *FakeFeatureDetector) GetFeatures() *Features {
 }
 
 var _ FeatureDetectorIface = (*FakeFeatureDetector)(nil)
-var _ FeatureDetectorIface = (*FeatureDetector)(nil)

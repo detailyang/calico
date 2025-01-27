@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,20 +27,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/projectcalico/calico/app-policy/checker"
-	"github.com/projectcalico/calico/app-policy/health"
-	"github.com/projectcalico/calico/app-policy/policystore"
-	"github.com/projectcalico/calico/app-policy/proto"
-	"github.com/projectcalico/calico/app-policy/syncher"
-	"github.com/projectcalico/calico/app-policy/uds"
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
 	"github.com/docopt/docopt-go"
 	authz_v2 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2"
 	authz_v2alpha "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2alpha"
 	authz "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+
+	"github.com/projectcalico/calico/app-policy/checker"
+	"github.com/projectcalico/calico/app-policy/health"
+	"github.com/projectcalico/calico/app-policy/policystore"
+	"github.com/projectcalico/calico/app-policy/proto"
+	"github.com/projectcalico/calico/app-policy/syncher"
+	"github.com/projectcalico/calico/app-policy/uds"
 )
 
 const usage = `Dikastes - the decider.
@@ -60,9 +59,6 @@ Options:
 var VERSION string
 
 func main() {
-	// Make sure the RNG is seeded.
-	seedrng.EnsureSeeded()
-
 	arguments, err := docopt.ParseArgs(usage, nil, VERSION)
 	if err != nil {
 		println(usage)
@@ -173,7 +169,7 @@ func runClient(arguments map[string]interface{}) {
 	method := arguments["<method>"].(string)
 
 	opts := uds.GetDialOptions()
-	conn, err := grpc.Dial(dial, opts...)
+	conn, err := grpc.NewClient(dial, opts...)
 	if err != nil {
 		log.Fatalf("fail to dial: %v", err)
 	}

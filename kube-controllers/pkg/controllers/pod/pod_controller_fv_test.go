@@ -20,16 +20,13 @@ import (
 	"os"
 	"time"
 
-	uuid "github.com/satori/go.uuid"
-
+	"github.com/google/uuid"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/kube-controllers/tests/testutils"
@@ -98,7 +95,7 @@ var _ = Describe("Calico pod controller FV tests (etcd mode)", func() {
 
 	It("should not overwrite a workload endpoint's container ID", func() {
 		// Create a Pod
-		podName := fmt.Sprintf("pod-fv-container-id-%s", uuid.NewV4())
+		podName := fmt.Sprintf("pod-fv-container-id-%s", uuid.NewString())
 		podNamespace := "default"
 		nodeName := "127.0.0.1"
 		pod := v1.Pod{
@@ -270,7 +267,7 @@ var _ = Describe("Calico pod controller FV tests (etcd mode)", func() {
 		}, time.Second*10, 500*time.Millisecond).ShouldNot(HaveOccurred())
 
 		// Create a Pod
-		podName := fmt.Sprintf("pod-fv-container-id-%s", uuid.NewV4())
+		podName := fmt.Sprintf("pod-fv-container-id-%s", uuid.NewString())
 		nodeName := "127.0.0.1"
 		pod := v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -370,7 +367,7 @@ var _ = Describe("Calico pod controller FV tests (etcd mode)", func() {
 
 	It("should not create a workload endpoint when one does not already exist", func() {
 		// Create a Pod
-		podName := fmt.Sprintf("pod-fv-no-create-wep-%s", uuid.NewV4())
+		podName := fmt.Sprintf("pod-fv-no-create-wep-%s", uuid.NewString())
 		pod := v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      podName,

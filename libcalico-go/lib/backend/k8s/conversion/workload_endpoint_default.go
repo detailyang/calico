@@ -21,12 +21,11 @@ import (
 	"os"
 	"strings"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	kapiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -121,9 +120,9 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 
 	// Build the labels map.  Start with the pod labels, and append two additional labels for
 	// namespace and orchestrator matches.
-	labels := pod.Labels
-	if labels == nil {
-		labels = make(map[string]string, 2)
+	labels := make(map[string]string)
+	for k, v := range pod.Labels {
+		labels[k] = v
 	}
 	labels[apiv3.LabelNamespace] = pod.Namespace
 	labels[apiv3.LabelOrchestrator] = apiv3.OrchestratorKubernetes
@@ -136,7 +135,6 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	// Pull out floating IP annotation
 	var floatingIPs []libapiv3.IPNAT
 	if annotation, ok := pod.Annotations["cni.projectcalico.org/floatingIPs"]; ok && len(podIPNets) > 0 {
-
 		// Parse Annotation data
 		var ips []string
 		err := json.Unmarshal([]byte(annotation), &ips)
@@ -182,58 +180,15 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 	}
 
 	// Handle source IP spoofing annotation
-	var sourcePrefixes []string
-	if annotation, ok := pod.Annotations["cni.projectcalico.org/allowedSourcePrefixes"]; ok && annotation != "" {
-		// Parse Annotation data
-		var requestedSourcePrefixes []string
-		err := json.Unmarshal([]byte(annotation), &requestedSourcePrefixes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%s' as JSON: %s", annotation, err)
-		}
-
-		// Filter out any invalid entries and normalize the CIDRs.
-		for _, prefix := range requestedSourcePrefixes {
-			if _, n, err := cnet.ParseCIDR(prefix); err != nil {
-				return nil, fmt.Errorf("failed to parse '%s' as a CIDR: %s", prefix, err)
-			} else {
-				sourcePrefixes = append(sourcePrefixes, n.String())
-			}
-		}
-
+	sourcePrefixes, err := HandleSourceIPSpoofingAnnotation(pod.Annotations)
+	if err != nil {
+		return nil, err
 	}
 
 	// Map any named ports through.
 	var endpointPorts []libapiv3.WorkloadEndpointPort
-	for _, container := range pod.Spec.Containers {
-		for _, containerPort := range container.Ports {
-			if containerPort.ContainerPort != 0 && (containerPort.HostPort != 0 || containerPort.Name != "") {
-				var modelProto numorstring.Protocol
-				switch containerPort.Protocol {
-				case kapiv1.ProtocolUDP:
-					modelProto = numorstring.ProtocolFromString("udp")
-				case kapiv1.ProtocolSCTP:
-					modelProto = numorstring.ProtocolFromString("sctp")
-				case kapiv1.ProtocolTCP, kapiv1.Protocol("") /* K8s default is TCP. */ :
-					modelProto = numorstring.ProtocolFromString("tcp")
-				default:
-					log.WithFields(log.Fields{
-						"protocol": containerPort.Protocol,
-						"pod":      pod,
-						"port":     containerPort,
-					}).Debug("Ignoring named port with unknown protocol")
-					continue
-				}
-
-				endpointPorts = append(endpointPorts, libapiv3.WorkloadEndpointPort{
-					Name:     containerPort.Name,
-					Protocol: modelProto,
-					Port:     uint16(containerPort.ContainerPort),
-					HostPort: uint16(containerPort.HostPort),
-					HostIP:   containerPort.HostIP,
-				})
-			}
-		}
-	}
+	endpointPorts = appendEndpointPorts(endpointPorts, pod, pod.Spec.Containers)
+	endpointPorts = appendEndpointPorts(endpointPorts, pod, pod.Spec.InitContainers)
 
 	// Get the container ID if present.  This is used in the CNI plugin to distinguish different pods that have
 	// the same name.  For example, restarted stateful set pods.
@@ -282,4 +237,62 @@ func (wc defaultWorkloadEndpointConverter) podToDefaultWorkloadEndpoint(pod *kap
 		Revision: pod.ResourceVersion,
 	}
 	return &kvp, nil
+}
+
+func appendEndpointPorts(ports []libapiv3.WorkloadEndpointPort, pod *kapiv1.Pod, containers []kapiv1.Container) []libapiv3.WorkloadEndpointPort {
+	for _, container := range containers {
+		for _, containerPort := range container.Ports {
+			if containerPort.ContainerPort != 0 && (containerPort.HostPort != 0 || containerPort.Name != "") {
+				var modelProto numorstring.Protocol
+				switch containerPort.Protocol {
+				case kapiv1.ProtocolUDP:
+					modelProto = numorstring.ProtocolFromString("udp")
+				case kapiv1.ProtocolSCTP:
+					modelProto = numorstring.ProtocolFromString("sctp")
+				case kapiv1.ProtocolTCP, kapiv1.Protocol("") /* K8s default is TCP. */ :
+					modelProto = numorstring.ProtocolFromString("tcp")
+				default:
+					log.WithFields(log.Fields{
+						"protocol": containerPort.Protocol,
+						"pod":      pod,
+						"port":     containerPort,
+					}).Debug("Ignoring named port with unknown protocol")
+					continue
+				}
+
+				ports = append(ports, libapiv3.WorkloadEndpointPort{
+					Name:     containerPort.Name,
+					Protocol: modelProto,
+					Port:     uint16(containerPort.ContainerPort),
+					HostPort: uint16(containerPort.HostPort),
+					HostIP:   containerPort.HostIP,
+				})
+			}
+		}
+	}
+	return ports
+}
+
+// HandleSourceIPSpoofingAnnotation parses the allowedSourcePrefixes annotation if present,
+// and returns the allowed prefixes as a slice of strings.
+func HandleSourceIPSpoofingAnnotation(annot map[string]string) ([]string, error) {
+	var sourcePrefixes []string
+	if annotation, ok := annot["cni.projectcalico.org/allowedSourcePrefixes"]; ok && annotation != "" {
+		// Parse Annotation data
+		var requestedSourcePrefixes []string
+		err := json.Unmarshal([]byte(annotation), &requestedSourcePrefixes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse '%s' as JSON: %s", annotation, err)
+		}
+
+		// Filter out any invalid entries and normalize the CIDRs.
+		for _, prefix := range requestedSourcePrefixes {
+			if _, n, err := cnet.ParseCIDR(prefix); err != nil {
+				return nil, fmt.Errorf("failed to parse '%s' as a CIDR: %s", prefix, err)
+			} else {
+				sourcePrefixes = append(sourcePrefixes, n.String())
+			}
+		}
+	}
+	return sourcePrefixes, nil
 }

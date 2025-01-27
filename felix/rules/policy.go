@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,52 +19,113 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
+	googleproto "google.golang.org/protobuf/proto"
 
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/hashutils"
 	"github.com/projectcalico/calico/felix/ipsets"
 	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 // ruleRenderer defined in rules_defs.go.
 
-func (r *DefaultRuleRenderer) PolicyToIptablesChains(policyID *proto.PolicyID, policy *proto.Policy, ipVersion uint8) []*iptables.Chain {
-	inbound := iptables.Chain{
-		Name:  PolicyChainName(PolicyInboundPfx, policyID),
-		Rules: r.ProtoRulesToIptablesRules(policy.InboundRules, ipVersion, fmt.Sprintf("Policy %s ingress", policyID.Name)),
+func (r *DefaultRuleRenderer) PolicyToIptablesChains(policyID *types.PolicyID, policy *proto.Policy, ipVersion uint8) []*generictables.Chain {
+	// TODO (mazdak): add staged policies later
+	isStaged := false
+	inbound := generictables.Chain{
+		Name: PolicyChainName(PolicyInboundPfx, policyID, r.NFTables),
+		// Note that the policy name includes the tier, so it does not need to be separately specified.
+		Rules: r.ProtoRulesToIptablesRules(
+			policy.InboundRules,
+			ipVersion, RuleOwnerTypePolicy,
+			RuleDirIngress,
+			policyID.Name,
+			policy.Untracked,
+			isStaged,
+			fmt.Sprintf("Policy %s ingress", policyID.Name),
+		),
 	}
-	outbound := iptables.Chain{
-		Name:  PolicyChainName(PolicyOutboundPfx, policyID),
-		Rules: r.ProtoRulesToIptablesRules(policy.OutboundRules, ipVersion, fmt.Sprintf("Policy %s egress", policyID.Name)),
+	outbound := generictables.Chain{
+		Name: PolicyChainName(PolicyOutboundPfx, policyID, r.NFTables),
+		// Note that the policy name also includes the tier, so it does not need to be separately specified.
+		Rules: r.ProtoRulesToIptablesRules(
+			policy.OutboundRules,
+			ipVersion, RuleOwnerTypePolicy,
+			RuleDirEgress,
+			policyID.Name,
+			policy.Untracked,
+			isStaged,
+			fmt.Sprintf("Policy %s egress", policyID.Name),
+		),
 	}
-	return []*iptables.Chain{&inbound, &outbound}
+	return []*generictables.Chain{&inbound, &outbound}
 }
 
-func (r *DefaultRuleRenderer) ProfileToIptablesChains(profileID *proto.ProfileID, profile *proto.Profile, ipVersion uint8) (inbound, outbound *iptables.Chain) {
-	inbound = &iptables.Chain{
-		Name:  ProfileChainName(ProfileInboundPfx, profileID),
-		Rules: r.ProtoRulesToIptablesRules(profile.InboundRules, ipVersion, fmt.Sprintf("Profile %s ingress", profileID.Name)),
+func (r *DefaultRuleRenderer) ProfileToIptablesChains(profileID *types.ProfileID, profile *proto.Profile, ipVersion uint8) (inbound, outbound *generictables.Chain) {
+	inbound = &generictables.Chain{
+		Name: ProfileChainName(ProfileInboundPfx, profileID, r.NFTables),
+		Rules: r.ProtoRulesToIptablesRules(
+			profile.InboundRules,
+			ipVersion,
+			RuleOwnerTypeProfile,
+			RuleDirIngress,
+			profileID.Name,
+			false,
+			false,
+			fmt.Sprintf("Profile %s ingress", profileID.Name),
+		),
 	}
-	outbound = &iptables.Chain{
-		Name:  ProfileChainName(ProfileOutboundPfx, profileID),
-		Rules: r.ProtoRulesToIptablesRules(profile.OutboundRules, ipVersion, fmt.Sprintf("Profile %s egress", profileID.Name)),
+	outbound = &generictables.Chain{
+		Name: ProfileChainName(ProfileOutboundPfx, profileID, r.NFTables),
+		Rules: r.ProtoRulesToIptablesRules(
+			profile.OutboundRules,
+			ipVersion, RuleOwnerTypeProfile,
+			RuleDirEgress,
+			profileID.Name,
+			false,
+			false,
+			fmt.Sprintf("Profile %s egress", profileID.Name),
+		),
 	}
 	return
 }
 
-func (r *DefaultRuleRenderer) ProtoRulesToIptablesRules(protoRules []*proto.Rule, ipVersion uint8, chainComments ...string) []iptables.Rule {
-	var rules []iptables.Rule
-	for _, protoRule := range protoRules {
-		rules = append(rules, r.ProtoRuleToIptablesRules(protoRule, ipVersion)...)
+func (r *DefaultRuleRenderer) ProtoRulesToIptablesRules(
+	protoRules []*proto.Rule,
+	ipVersion uint8,
+	owner RuleOwnerType,
+	dir RuleDir,
+	name string,
+	untracked,
+	staged bool,
+	chainComments ...string,
+) []generictables.Rule {
+	var rules []generictables.Rule
+	for ii, protoRule := range protoRules {
+		// TODO (Matt): Need rule hash when that's cleaned up.
+		rules = append(rules, r.ProtoRuleToIptablesRules(protoRule, ipVersion, owner, dir, ii, name, untracked, staged)...)
+	}
+	// Strip off any return rules at the end of the chain.  No matter their
+	// match criteria, they're effectively no-ops.
+	for len(rules) > 0 {
+		if _, ok := rules[len(rules)-1].Action.(generictables.ReturnActionMarker); ok {
+			rules = rules[:len(rules)-1]
+		} else {
+			break
+		}
 	}
 	if len(chainComments) > 0 {
 		if len(rules) == 0 {
-			rules = append(rules, iptables.Rule{})
+			rules = append(rules, generictables.Rule{})
 		}
 		rules[0].Comment = append(rules[0].Comment, chainComments...)
 	}
 	return rules
 }
+
 func filterNets(mixedCIDRs []string, ipVersion uint8) (filtered []string, filteredAll bool) {
 	if len(mixedCIDRs) == 0 {
 		return nil, false
@@ -101,7 +162,7 @@ func FilterRuleToIPVersion(ipVersion uint8, pRule *proto.Rule) *proto.Rule {
 	// rules of the form "allow from 10.0.0.1,feed::beef to 10.0.0.2" will get filtered out,
 	// and only for IPv6, where there's no obvious meaning to the rule.
 
-	ruleCopy := *pRule
+	ruleCopy := googleproto.Clone(pRule).(*proto.Rule)
 	var filteredAll bool
 
 	logCxt := log.WithFields(log.Fields{
@@ -130,11 +191,18 @@ func FilterRuleToIPVersion(ipVersion uint8, pRule *proto.Rule) *proto.Rule {
 	if filteredAll {
 		return nil
 	}
-	return &ruleCopy
+	return ruleCopy
 }
 
-func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(pRule *proto.Rule, ipVersion uint8) []iptables.Rule {
-
+func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(
+	pRule *proto.Rule,
+	ipVersion uint8,
+	owner RuleOwnerType,
+	dir RuleDir,
+	idx int, name string,
+	untracked bool,
+	staged bool,
+) []generictables.Rule {
 	ruleCopy := FilterRuleToIPVersion(ipVersion, pRule)
 	if ruleCopy == nil {
 		return nil
@@ -183,8 +251,10 @@ func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(pRule *proto.Rule, ipVers
 	//
 	// The matchBlockBuilder wraps up the above logic:
 	matchBlockBuilder := matchBlockBuilder{
-		markAllBlocksPass: r.IptablesMarkScratch0,
-		markThisBlockPass: r.IptablesMarkScratch1,
+		actions:           r.ActionFactory,
+		newMatch:          r.NewMatch,
+		markAllBlocksPass: r.MarkScratch0,
+		markThisBlockPass: r.MarkScratch1,
 	}
 
 	// Port matches.  We only need to render blocks of ports if, in total, there's more than one
@@ -265,24 +335,11 @@ func (r *DefaultRuleRenderer) ProtoRuleToIptablesRules(pRule *proto.Rule, ipVers
 		// success.  Add a match on that bit to the calculated rule.
 		match = match.MarkSingleBitSet(matchBlockBuilder.markAllBlocksPass)
 	}
-	markBit, actions := r.CalculateActions(ruleCopy, ipVersion)
+
+	//TODO (mazdak): add staged policies later.
+	rules := r.CombineMatchAndActionsForProtoRule(ruleCopy, match, owner, dir, idx, name, untracked, staged)
 	rs := matchBlockBuilder.Rules
-	if markBit != 0 {
-		// The rule needs to do more than one action. Render a rule that
-		// executes the match criteria and sets the given mark bit if it
-		// matches, then render the actions as separate rules below.
-		rs = append(rs, iptables.Rule{
-			Match:  match,
-			Action: iptables.SetMarkAction{Mark: markBit},
-		})
-		match = iptables.Match().MarkSingleBitSet(markBit)
-	}
-	for _, action := range actions {
-		rs = append(rs, iptables.Rule{
-			Match:  match,
-			Action: action,
-		})
-	}
+	rs = append(rs, rules...)
 
 	// Render rule annotations as comments on each rule.
 	for i := range rs {
@@ -301,7 +358,10 @@ type matchBlockBuilder struct {
 	markAllBlocksPass uint32
 	markThisBlockPass uint32
 
-	Rules []iptables.Rule
+	newMatch func() generictables.MatchCriteria
+	actions  generictables.ActionFactory
+
+	Rules []generictables.Rule
 }
 
 func (r *matchBlockBuilder) AppendPortMatchBlock(
@@ -323,19 +383,19 @@ func (r *matchBlockBuilder) AppendPortMatchBlock(
 		"srcOrDst":     srcOrDst,
 	})
 	for _, split := range numericPortSplits {
-		m := appendProtocolMatch(iptables.Match(), protocol, logCxt)
+		m := appendProtocolMatch(r.newMatch(), protocol, logCxt)
 		m = srcOrDst.AppendMatchPorts(m, split)
-		r.Rules = append(r.Rules, iptables.Rule{
+		r.Rules = append(r.Rules, generictables.Rule{
 			Match:  m,
-			Action: iptables.SetMarkAction{Mark: markToSet},
+			Action: r.actions.SetMark(markToSet),
 		})
 	}
 
 	for _, namedPortIPSetID := range namedPortIPSetIDs {
 		ipsetName := ipSetConfig.NameForMainIPSet(namedPortIPSetID)
-		r.Rules = append(r.Rules, iptables.Rule{
-			Match:  srcOrDst.MatchIPPortIPSet(ipsetName),
-			Action: iptables.SetMarkAction{Mark: markToSet},
+		r.Rules = append(r.Rules, generictables.Rule{
+			Match:  srcOrDst.MatchIPPortIPSet(r.newMatch(), ipsetName),
+			Action: r.actions.SetMark(markToSet),
 		})
 	}
 
@@ -351,9 +411,9 @@ func (r *matchBlockBuilder) AppendCIDRMatchBlock(cidrs []string, srcOrDst srcOrD
 
 	// Render the per-CIDR rules.
 	for _, cidr := range cidrs {
-		r.Rules = append(r.Rules, iptables.Rule{
-			Match:  srcOrDst.MatchNet(cidr),
-			Action: iptables.SetMarkAction{Mark: markToSet},
+		r.Rules = append(r.Rules, generictables.Rule{
+			Match:  srcOrDst.MatchNet(r.newMatch(), cidr),
+			Action: r.actions.SetMark(markToSet),
 		})
 	}
 
@@ -370,9 +430,9 @@ func (r *matchBlockBuilder) AppendNegatedCIDRMatchBlock(cidrs []string, srcOrDst
 	// This gives the desired "not any" behaviour.
 	for _, cidr := range cidrs {
 		r.Rules = append(r.Rules,
-			iptables.Rule{
-				Match:  srcOrDst.MatchNet(cidr),
-				Action: iptables.ClearMarkAction{Mark: r.markAllBlocksPass},
+			generictables.Rule{
+				Match:  srcOrDst.MatchNet(r.newMatch(), cidr),
+				Action: r.actions.ClearMark(r.markAllBlocksPass),
 			},
 		)
 	}
@@ -383,11 +443,11 @@ func (r *matchBlockBuilder) maybeAppendInitialRule(markBitsToSetInitially uint32
 		return
 	}
 	r.Rules = append(r.Rules,
-		iptables.Rule{
-			Action: iptables.SetMaskedMarkAction{
-				Mark: markBitsToSetInitially,
-				Mask: r.markAllBlocksPass | r.markThisBlockPass,
-			},
+		generictables.Rule{
+			Action: r.actions.SetMaskedMark(
+				markBitsToSetInitially,
+				r.markAllBlocksPass|r.markThisBlockPass,
+			),
 		},
 	)
 	r.UsingMatchBlocks = true
@@ -428,9 +488,9 @@ func (r *matchBlockBuilder) finishPositiveBlock() {
 	//
 	//     <AllBlocks bit> &&= <ThisBlock bit>
 	//
-	r.Rules = append(r.Rules, iptables.Rule{
-		Match:  iptables.Match().MarkClear(r.markThisBlockPass),
-		Action: iptables.ClearMarkAction{Mark: r.markAllBlocksPass},
+	r.Rules = append(r.Rules, generictables.Rule{
+		Match:  r.newMatch().MarkClear(r.markThisBlockPass),
+		Action: r.actions.ClearMark(r.markAllBlocksPass),
 	})
 }
 
@@ -442,19 +502,19 @@ const (
 	dst
 )
 
-// MatchNet returns a new SourceNet or DestNet MatchCriteria for the given CIDR.
-func (sod srcOrDst) MatchNet(cidr string) iptables.MatchCriteria {
+// MatchNet returns a new SourceNet or DestNet generictables.MatchCriteria for the given CIDR.
+func (sod srcOrDst) MatchNet(m generictables.MatchCriteria, cidr string) generictables.MatchCriteria {
 	switch sod {
 	case src:
-		return iptables.Match().SourceNet(cidr)
+		return m.SourceNet(cidr)
 	case dst:
-		return iptables.Match().DestNet(cidr)
+		return m.DestNet(cidr)
 	}
 	log.WithField("srcOrDst", sod).Panic("Unknown source or dest type.")
 	return nil
 }
 
-func (sod srcOrDst) AppendMatchPorts(m iptables.MatchCriteria, pr []*proto.PortRange) iptables.MatchCriteria {
+func (sod srcOrDst) AppendMatchPorts(m generictables.MatchCriteria, pr []*proto.PortRange) generictables.MatchCriteria {
 	switch sod {
 	case src:
 		return m.SourcePortRanges(pr)
@@ -465,12 +525,12 @@ func (sod srcOrDst) AppendMatchPorts(m iptables.MatchCriteria, pr []*proto.PortR
 	return nil
 }
 
-func (sod srcOrDst) MatchIPPortIPSet(setID string) iptables.MatchCriteria {
+func (sod srcOrDst) MatchIPPortIPSet(m generictables.MatchCriteria, setID string) generictables.MatchCriteria {
 	switch sod {
 	case src:
-		return iptables.Match().SourceIPPortSet(setID)
+		return m.SourceIPPortSet(setID)
 	case dst:
-		return iptables.Match().DestIPPortSet(setID)
+		return m.DestIPPortSet(setID)
 	}
 	log.WithField("srcOrDst", sod).Panic("Unknown source or dest type.")
 	return nil
@@ -508,35 +568,137 @@ func SplitPortList(ports []*proto.PortRange) (splits [][]*proto.PortRange) {
 	return
 }
 
-func (r *DefaultRuleRenderer) CalculateActions(pRule *proto.Rule, ipVersion uint8) (mark uint32, actions []iptables.Action) {
-	actions = []iptables.Action{}
+// CombineMatchAndActionsForProtoRule takes in the proto.Rule along with the match (and some other parameters) and
+// returns as set of rules. The actions that are needed are calculated from the proto.Rule and the parameters, then
+// the match given and actions calculated are combined into the returned set of rules.
+func (r *DefaultRuleRenderer) CombineMatchAndActionsForProtoRule(
+	pRule *proto.Rule,
+	match generictables.MatchCriteria,
+	owner RuleOwnerType,
+	dir RuleDir,
+	idx int,
+	name string,
+	untracked,
+	staged bool,
+) []generictables.Rule {
+	var rules []generictables.Rule
+	var mark uint32
+
+	if pRule.Action == "log" {
+		// This rule should log (and possibly do something else too).
+		logPrefix := r.LogPrefix
+		if logPrefix == "" {
+			logPrefix = "calico-packet"
+		}
+		rules = append(rules, generictables.Rule{
+			Match:  r.NewMatch(),
+			Action: r.Log(logPrefix),
+		})
+	}
+
+	nflogGroup := NFLOGOutboundGroup
+	if dir == RuleDirIngress {
+		nflogGroup = NFLOGInboundGroup
+	}
 
 	switch pRule.Action {
 	case "", "allow":
-		// Allow needs to set the accept mark, and then return to the calling chain for
-		// further processing.
-		mark = r.IptablesMarkAccept
-		actions = append(actions, iptables.ReturnAction{})
+		// If this is not a staged policy then allow needs to set the accept mark.
+		if !staged {
+			mark = r.MarkAccept
+		}
+
+		// NFLOG the allow - we don't do this for untracked due to the performance hit.
+		if !untracked {
+			rules = append(rules, generictables.Rule{
+				Match: r.NewMatch(),
+				Action: r.Nflog(
+					nflogGroup,
+					CalculateNFLOGPrefixStr(RuleActionAllow, owner, dir, idx, name),
+					0,
+				),
+			})
+		}
+
+		// Return to calling chain for end of policy.
+		rules = append(rules, generictables.Rule{Match: r.NewMatch(), Action: r.Return()})
 	case "next-tier", "pass":
-		// pass (called next-tier in the API for historical reasons) needs to set the pass
-		// mark, and then return to the calling chain for further processing.
-		mark = r.IptablesMarkPass
-		actions = append(actions, iptables.ReturnAction{})
+		// If this is not a staged policy then pass (called next-tier in the API for historical reasons) needs to set
+		// the pass mark.
+		if !staged {
+			mark = r.MarkPass
+		}
+
+		// NFLOG the pass - we don't do this for untracked due to the performance hit.
+		if !untracked {
+			rules = append(rules, generictables.Rule{
+				Match: r.NewMatch(),
+				Action: r.Nflog(
+					nflogGroup,
+					CalculateNFLOGPrefixStr(RuleActionPass, owner, dir, idx, name),
+					0,
+				),
+			})
+		}
+
+		// Return to calling chain for end of policy.
+		rules = append(rules, generictables.Rule{Match: r.NewMatch(), Action: r.Return()})
 	case "deny":
-		// Deny maps to DROP/REJECT.
-		actions = append(actions, r.IptablesFilterDenyAction())
+		// If this is not a staged policy then deny maps to DROP.
+		if !staged {
+			mark = r.MarkDrop
+		}
+
+		// NFLOG the deny - we don't do this for untracked due to the performance hit.
+		if !untracked {
+			rules = append(rules, generictables.Rule{
+				Match: r.NewMatch(),
+				Action: r.Nflog(
+					nflogGroup,
+					CalculateNFLOGPrefixStr(RuleActionDeny, owner, dir, idx, name),
+					0,
+				),
+			})
+		}
+
+		if !staged {
+			// We defer to DropActions() to allow for "sandbox" mode.
+			rules = append(rules, generictables.Rule{
+				Match:  r.NewMatch(),
+				Action: r.IptablesFilterDenyAction(),
+			})
+		} else {
+			// For staged mode we simply return to calling chain for end of policy.
+			rules = append(rules, generictables.Rule{Match: r.NewMatch(), Action: r.Return()})
+		}
 	case "log":
-		// This rule should log.
-		actions = append(actions, iptables.LogAction{
-			Prefix: r.IptablesLogPrefix,
-		})
+		// Handled above.
 	default:
 		log.WithField("action", pRule.Action).Panic("Unknown rule action")
 	}
-	return
+
+	finalRules := []generictables.Rule{}
+	// if the mark is not set then this is either a staged policy or the rule action is "log".
+	if mark != 0 {
+		// The rule needs to do more than one action. Render a rule that
+		// executes the match criteria and sets the given mark bit if it
+		// matches, then render the actions as separate rules below.
+		finalRules = append(finalRules, generictables.Rule{
+			Match:  match,
+			Action: r.SetMark(mark),
+		})
+		match = r.NewMatch().MarkSingleBitSet(mark)
+	}
+
+	for _, rule := range rules {
+		rule.Match = r.CombineMatches(rule.Match, match)
+		finalRules = append(finalRules, rule)
+	}
+
+	return finalRules
 }
 
-func appendProtocolMatch(match iptables.MatchCriteria, protocol *proto.Protocol, logCxt *log.Entry) iptables.MatchCriteria {
+func appendProtocolMatch(match generictables.MatchCriteria, protocol *proto.Protocol, logCxt *log.Entry) generictables.MatchCriteria {
 	if protocol == nil {
 		return match
 	}
@@ -553,8 +715,8 @@ func appendProtocolMatch(match iptables.MatchCriteria, protocol *proto.Protocol,
 	return match
 }
 
-func (r *DefaultRuleRenderer) CalculateRuleMatch(pRule *proto.Rule, ipVersion uint8) iptables.MatchCriteria {
-	match := iptables.Match()
+func (r *DefaultRuleRenderer) CalculateRuleMatch(pRule *proto.Rule, ipVersion uint8) generictables.MatchCriteria {
+	match := r.NewMatch()
 
 	logCxt := log.WithFields(log.Fields{
 		"ipVersion": ipVersion,
@@ -782,18 +944,26 @@ func (r *DefaultRuleRenderer) CalculateRuleMatch(pRule *proto.Rule, ipVersion ui
 	return match
 }
 
-func PolicyChainName(prefix PolicyChainNamePrefix, polID *proto.PolicyID) string {
+func PolicyChainName(prefix PolicyChainNamePrefix, polID *types.PolicyID, nft bool) string {
+	maxLen := iptables.MaxChainNameLength
+	if nft {
+		maxLen = nftables.MaxChainNameLength
+	}
 	return hashutils.GetLengthLimitedID(
 		string(prefix),
-		polID.Name,
-		iptables.MaxChainNameLength,
+		polID.Tier+"/"+polID.Name,
+		maxLen,
 	)
 }
 
-func ProfileChainName(prefix ProfileChainNamePrefix, profID *proto.ProfileID) string {
+func ProfileChainName(prefix ProfileChainNamePrefix, profID *types.ProfileID, nft bool) string {
+	maxLen := iptables.MaxChainNameLength
+	if nft {
+		maxLen = nftables.MaxChainNameLength
+	}
 	return hashutils.GetLengthLimitedID(
 		string(prefix),
 		profID.Name,
-		iptables.MaxChainNameLength,
+		maxLen,
 	)
 }

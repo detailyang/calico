@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 #include <linux/bpf.h>
 #include "sockops.h"
 
-struct bpf_map_def __attribute__((section("maps"))) calico_sk_endpoints = {
-	.type           = BPF_MAP_TYPE_LPM_TRIE,
-	.key_size       = sizeof(union ip4_bpf_lpm_trie_key),
-	.value_size     = sizeof(__u32),
-	.max_entries    = 65535,
-	.map_flags      = BPF_F_NO_PREALLOC,
-};
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __type(key, union ip4_bpf_lpm_trie_key);
+    __type(value, __u32);
+    __uint(max_entries, 65535);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} calico_sk_endpoints SEC(".maps");
 
 __attribute__((section("calico_sockops_func")))
 enum bpf_ret_code calico_sockops(struct bpf_sock_ops *skops)
@@ -29,7 +29,6 @@ enum bpf_ret_code calico_sockops(struct bpf_sock_ops *skops)
 	struct sock_key key = {};
 	union ip4_bpf_lpm_trie_key sip, dip;
 	__u32 sport, dport;
-	int err;
 
 	switch (skops->op) {
 		case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
@@ -80,7 +79,7 @@ enum bpf_ret_code calico_sockops(struct bpf_sock_ops *skops)
 		key.envoy_side = 0;
 	}
 
-	err = bpf_sock_hash_update(skops, &calico_sock_map, &key, BPF_ANY);
+	bpf_sock_hash_update(skops, &calico_sock_map, &key, BPF_ANY);
 
 	return BPF_OK;
 }

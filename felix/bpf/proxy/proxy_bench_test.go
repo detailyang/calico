@@ -23,12 +23,6 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/felix/cachingmap"
-
-	"github.com/projectcalico/calico/felix/bpf/maps"
-	"github.com/projectcalico/calico/felix/bpf/nat"
-
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -46,19 +40,13 @@ func benchmarkProxyUpdates(b *testing.B, svcN, epsN int) {
 		eps := makeEps(svcN, epsN)
 		k8s := fake.NewSimpleClientset(append(svcs, eps...)...)
 
-		feCache := cachingmap.New[nat.FrontendKey, nat.FrontendValue](nat.FrontendMapParameters.Name,
-			maps.NewTypedMap[nat.FrontendKey, nat.FrontendValue](
-				&mock.DummyMap{}, nat.FrontendKeyFromBytes, nat.FrontendValueFromBytes))
-		beCache := cachingmap.New[nat.BackendKey, nat.BackendValue](nat.BackendMapParameters.Name,
-			maps.NewTypedMap[nat.BackendKey, nat.BackendValue](
-				&mock.DummyMap{}, nat.BackendKeyFromBytes, nat.BackendValueFromBytes))
-
-		syncer, err := proxy.NewSyncer(
+		syncer, err := proxy.NewSyncer(4,
 			[]net.IP{net.IPv4(1, 1, 1, 1)},
-			feCache,
-			beCache,
+			&mock.DummyMap{},
+			&mock.DummyMap{},
 			&mock.DummyMap{},
 			proxy.NewRTCache(),
+			nil,
 		)
 		Expect(err).ShouldNot(HaveOccurred())
 

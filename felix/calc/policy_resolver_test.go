@@ -1,14 +1,30 @@
+// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package calc
 
 import (
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 )
 
 func TestPolicyResolver_OnUpdate(t *testing.T) {
-	pr := NewPolicyResolver()
+	pr, recorder := createPolicyResolver()
 
 	polKey := model.PolicyKey{
 		Name: "test-policy",
@@ -37,23 +53,75 @@ func TestPolicyResolver_OnUpdate(t *testing.T) {
 	if _, found := pr.allPolicies[polKey]; found {
 		t.Error("Deleting inactive policy - expected AllPolicies not to contain policy but it does")
 	}
+
+	// Haven't sent any endpoints or matches so should get nothing out.
+	pr.OnDatamodelStatus(api.InSync)
+	pr.Flush()
+	if len(recorder.updates) > 0 {
+		t.Error("Unexpected updates from policy resolver:", recorder.updates)
+	}
+}
+
+func createPolicyResolver() (*PolicyResolver, *policyResolverRecorder) {
+	pr := NewPolicyResolver()
+	recorder := newPolicyResolverRecorder()
+	pr.RegisterCallback(recorder)
+	return pr, recorder
+}
+
+type policyResolverUpdate struct {
+	Key      model.Key
+	Endpoint interface{}
+	Tiers    []TierInfo
+}
+
+type policyResolverRecorder struct {
+	updates []policyResolverUpdate
+}
+
+func (p *policyResolverRecorder) OnEndpointTierUpdate(endpointKey model.Key, endpoint interface{}, filteredTiers []TierInfo) {
+	p.updates = append(p.updates, policyResolverUpdate{
+		Key:      endpointKey,
+		Endpoint: endpoint,
+		Tiers:    filteredTiers,
+	})
+}
+
+func newPolicyResolverRecorder() *policyResolverRecorder {
+	return &policyResolverRecorder{}
 }
 
 func TestPolicyResolver_OnPolicyMatch(t *testing.T) {
-	pr := NewPolicyResolver()
+	pr, recorder := createPolicyResolver()
 
 	polKey := model.PolicyKey{
+		Tier: "default",
 		Name: "test-policy",
 	}
 
-	pol := model.Policy{}
+	pol := ExtractPolicyMetadata(&model.Policy{})
 
 	endpointKey := model.WorkloadEndpointKey{
 		Hostname: "test-workload-ep",
 	}
+	wep := &model.WorkloadEndpoint{
+		Name: "we1",
+	}
+	pr.endpoints[endpointKey] = wep
 
-	pr.allPolicies[polKey] = &pol
+	pr.allPolicies[polKey] = pol
+
+	// Haven't sent any matches so should get nothing out.
+	pr.Flush()
+	if len(recorder.updates) > 0 {
+		t.Error("Unexpected updates from policy resolver:", recorder.updates)
+	}
+
 	pr.OnPolicyMatch(polKey, endpointKey)
+	if len(recorder.updates) > 0 {
+		// Shouldn't get any updates until we Flush()
+		t.Error("Unexpected updates from policy resolver before calling Flush():", recorder.updates)
+	}
 
 	if !pr.policyIDToEndpointIDs.ContainsKey(polKey) {
 		t.Error("Adding new policy - expected PolicyIDToEndpointIDs to contain new policy but it does not")
@@ -66,24 +134,47 @@ func TestPolicyResolver_OnPolicyMatch(t *testing.T) {
 	}
 
 	pr.OnPolicyMatch(polKey, endpointKey)
+	pr.OnDatamodelStatus(api.InSync)
+	pr.Flush()
+	if len(recorder.updates) != 1 {
+		t.Fatal("Expected only one update after Flush:", recorder.updates)
+	}
+	if d := cmp.Diff(recorder.updates[0], policyResolverUpdate{
+		Key:      endpointKey,
+		Endpoint: wep,
+		Tiers: []TierInfo{{
+			Name:  "default",
+			Valid: true,
+			OrderedPolicies: []PolKV{
+				{
+					Key:   polKey,
+					Value: &pol,
+				},
+			},
+		}},
+	}, cmp.AllowUnexported(PolKV{})); d != "" {
+		t.Error("Incorrect update:", d)
+	}
 }
 
 func TestPolicyResolver_OnPolicyMatchStopped(t *testing.T) {
-	pr := NewPolicyResolver()
+	pr, recorder := createPolicyResolver()
+	pr.OnDatamodelStatus(api.InSync)
 
 	polKey := model.PolicyKey{
+		Tier: "default",
 		Name: "test-policy",
 	}
 
-	pol := model.Policy{}
+	pol := policyMetadata{}
 
 	endpointKey := model.WorkloadEndpointKey{
 		Hostname: "test-workload-ep",
 	}
 
-	pr.policyIDToEndpointIDs.Put(polKey, endpointKey)
-	pr.endpointIDToPolicyIDs.Put(endpointKey, polKey)
 	pr.policySorter.UpdatePolicy(polKey, &pol)
+
+	pr.OnPolicyMatch(polKey, endpointKey)
 	pr.OnPolicyMatchStopped(polKey, endpointKey)
 
 	if pr.policyIDToEndpointIDs.ContainsKey(polKey) {
@@ -97,4 +188,20 @@ func TestPolicyResolver_OnPolicyMatchStopped(t *testing.T) {
 	}
 
 	pr.OnPolicyMatchStopped(polKey, endpointKey)
+
+	if len(recorder.updates) > 0 {
+		// Shouldn't get any updates until we Flush()
+		t.Error("Unexpected updates from policy resolver before calling Flush():", recorder.updates)
+	}
+	pr.Flush()
+	if len(recorder.updates) != 1 {
+		t.Fatal("Expected one update after Flush:", recorder.updates)
+	}
+	if d := cmp.Diff(recorder.updates[0], policyResolverUpdate{
+		Key:      endpointKey,
+		Endpoint: nil,
+		Tiers:    []TierInfo{},
+	}); d != "" {
+		t.Error("Incorrect update:", d)
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,8 @@ import (
 	"net"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
@@ -283,6 +282,11 @@ func convertIpPoolFromStorage(pool *apiv3.IPPool) error {
 		pool.Spec.VXLANMode = apiv3.VXLANModeNever
 	}
 
+	if pool.Spec.AssignmentMode == nil {
+		automatic := apiv3.Automatic
+		pool.Spec.AssignmentMode = &automatic
+	}
+
 	return nil
 }
 
@@ -353,6 +357,30 @@ func (r ipPools) validateAndSetDefaults(ctx context.Context, new, old *apiv3.IPP
 		new.Spec.AllowedUses = []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel}
 	}
 
+	// Update, check if previously AllowedUses was LoadBalancer it has not changed
+	if old != nil {
+		oldLoadBalancer := false
+		for _, u := range old.Spec.AllowedUses {
+			if u == apiv3.IPPoolAllowedUseLoadBalancer {
+				oldLoadBalancer = true
+			}
+		}
+		for _, u := range new.Spec.AllowedUses {
+			if u != apiv3.IPPoolAllowedUseLoadBalancer && oldLoadBalancer {
+				return cerrors.ErrorValidation{ErroredFields: []cerrors.ErroredField{{
+					Name:   "IPPool.Spec.AllowedUses",
+					Reason: "IPPool allowed use cannot be changed from LoadBalacer to Workload or Tunnel",
+					Value:  new.Spec.AllowedUses,
+				}}}
+			}
+		}
+	}
+
+	if new.Spec.AssignmentMode == nil {
+		automatic := apiv3.Automatic
+		new.Spec.AssignmentMode = &automatic
+	}
+
 	// Check that the blockSize hasn't changed since updates are not supported.
 	if old != nil && old.Spec.BlockSize != new.Spec.BlockSize {
 		errFields = append(errFields, cerrors.ErroredField{
@@ -404,8 +432,8 @@ func (r ipPools) validateAndSetDefaults(ctx context.Context, new, old *apiv3.IPP
 		}
 
 		for _, otherPool := range allPools.Items {
-			// It's possible that Create is called for a pre-existing pool, so skip our own
-			// pool and let the generic processing handle the pre-existing resource error case.
+			// It's possible that Create is called for a preexisting pool, so skip our own
+			// pool and let the generic processing handle the preexisting resource error case.
 			if otherPool.Name == new.Name {
 				continue
 			}

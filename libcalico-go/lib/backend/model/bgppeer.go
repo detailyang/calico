@@ -21,9 +21,8 @@ import (
 	"strconv"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -201,7 +200,7 @@ type BGPPeer struct {
 	PeerIP net.IP `json:"ip"`
 
 	// ASNum is the AS number of the peer.  Note that we write out the
-	// value as a string in to the backend, because confd templating
+	// value as a string in the backend, because confd templating
 	// converts large uints to float e notation which breaks the BIRD
 	// configuration.
 	ASNum numorstring.ASNumber `json:"as_num,string"`

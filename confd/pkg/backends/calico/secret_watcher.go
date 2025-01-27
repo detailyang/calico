@@ -23,9 +23,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 type secretWatchData struct {
@@ -63,11 +63,11 @@ func NewSecretWatcher(c *client) (*secretWatcher, error) {
 	// set up k8s client
 	// attempt 1: KUBECONFIG env var
 	cfgFile := os.Getenv("KUBECONFIG")
-	cfg, err := clientcmd.BuildConfigFromFlags("", cfgFile)
+	cfg, err := winutils.BuildConfigFromFlags("", cfgFile)
 	if err != nil {
 		log.WithError(err).Info("KUBECONFIG environment variable not found, attempting in-cluster")
 		// attempt 2: in cluster config
-		if cfg, err = rest.InClusterConfig(); err != nil {
+		if cfg, err = winutils.GetInClusterConfig(); err != nil {
 			return nil, err
 		}
 	}
@@ -96,7 +96,12 @@ func (sw *secretWatcher) ensureWatchingSecret(name string) {
 		log.Debugf("Start a watch for secret '%v' (namespace %v)", name, sw.namespace)
 		// We're not watching this secret yet, so start a watch for it.
 		watcher := cache.NewListWatchFromClient(sw.k8sClientset.CoreV1().RESTClient(), "secrets", sw.namespace, fields.OneTermEqualSelector("metadata.name", name))
-		_, controller := cache.NewInformer(watcher, &v1.Secret{}, 0, sw)
+		_, controller := cache.NewInformerWithOptions(cache.InformerOptions{
+			ListerWatcher: watcher,
+			ObjectType:    &v1.Secret{},
+			ResyncPeriod:  0,
+			Handler:       sw,
+		})
 		sw.watches[name] = &secretWatchData{stopCh: make(chan struct{})}
 		go controller.Run(sw.watches[name].stopCh)
 		log.Debugf("Controller for secret '%v' is now running", name)
@@ -148,12 +153,12 @@ func (sw *secretWatcher) GetSecret(name, key string) (string, error) {
 
 	// Get and decode the key of interest.
 	if sw.watches[name].secret == nil {
-		return "", fmt.Errorf("No data available for secret %v", name)
+		return "", fmt.Errorf("no data available for secret %v", name)
 	}
 	if data, ok := sw.watches[name].secret.Data[key]; ok {
 		return string(data), nil
 	} else {
-		return "", fmt.Errorf("Secret %v does not have key %v", name, key)
+		return "", fmt.Errorf("secret %v does not have key %v", name, key)
 	}
 }
 
@@ -169,7 +174,7 @@ func (sw *secretWatcher) SweepStale() {
 	}
 }
 
-func (sw *secretWatcher) OnAdd(obj interface{}) {
+func (sw *secretWatcher) OnAdd(obj interface{}, isInInitialList bool) {
 	log.Debug("Secret added")
 	sw.updateSecret(obj.(*v1.Secret))
 	sw.client.recheckPeerConfig()

@@ -23,9 +23,8 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
@@ -35,7 +34,6 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("Block affinity tests", testutils.DatastoreAll, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name1 := "affinity-1"
 	name2 := "affinity-2"
@@ -44,12 +42,14 @@ var _ = testutils.E2eDatastoreDescribe("Block affinity tests", testutils.Datasto
 		Node:    "node-1",
 		CIDR:    "10.0.0.0/24",
 		Deleted: "false",
+		Type:    "host",
 	}
 	spec2 := libapiv3.BlockAffinitySpec{
 		State:   "confirmed",
 		Node:    "node-2",
 		CIDR:    "10.1.0.0/24",
 		Deleted: "false",
+		Type:    "host",
 	}
 
 	var c clientv3.Interface
@@ -70,7 +70,7 @@ var _ = testutils.E2eDatastoreDescribe("Block affinity tests", testutils.Datasto
 		func(name1, name2 string, spec1, spec2 libapiv3.BlockAffinitySpec) {
 			By("Updating the block affinity before it is created")
 			_, outError := c.BlockAffinities().Update(ctx, &libapiv3.BlockAffinity{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-affinity"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -157,7 +157,7 @@ var _ = testutils.E2eDatastoreDescribe("Block affinity tests", testutils.Datasto
 
 			By("Attempting to update the BlockAffinity without a Creation Timestamp")
 			res, outError = c.BlockAffinities().Update(ctx, &libapiv3.BlockAffinity{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-affinity"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -228,7 +228,7 @@ var _ = testutils.E2eDatastoreDescribe("Block affinity tests", testutils.Datasto
 			res1.Spec = spec2
 			_, outError = c.BlockAffinities().Update(ctx, res1, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("error with field Spec.Deleted = '{confirmed node-2 10.1.0.0/24 true}' (spec.Deleted cannot be set to \"true\")"))
+			Expect(outError.Error()).To(Equal("error with field Spec.Deleted = '{confirmed node-2 host 10.1.0.0/24 true}' (spec.Deleted cannot be set to \"true\")"))
 
 			By("Deleting BlockAffinity (name1)")
 			spec2.Deleted = "false"

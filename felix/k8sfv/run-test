@@ -240,6 +240,7 @@ docker run --detach --privileged --name ${prefix}-felix \
        -e FELIX_PROMETHEUSMETRICSENABLED=true \
        -e FELIX_USAGEREPORTINGENABLED=false \
        -e FELIX_DEBUGMEMORYPROFILEPATH="heap-<timestamp>" \
+       -e FELIX_NFTABLESENABLED=${FELIX_FV_NFTABLES} \
        -e K8S_API_ENDPOINT=${k8s_api_endpoint} \
        -e K8S_INSECURE_SKIP_TLS_VERIFY=true \
        -e K8SFV_LOG_LEVEL=${K8SFV_LOG_LEVEL} \
@@ -271,6 +272,16 @@ elif ${JUST_A_MINUTE}; then
     if [ $cmdStatus -ne 0 ]; then
         echo "docker or k7sfv.test command failed with RC $cmdStatus"
         echo "Status 137 can be caused by the felix container (in which we run the test binary) dying."
+        echo "Dumping felix container logs..."
+        echo
+
+        docker logs ${prefix}-felix
+
+        echo
+        echo "Finished dumping felix container logs."
+        echo "docker or k7sfv.test command failed with RC $cmdStatus"
+        echo "Status 137 can be caused by the felix container (in which we run the test binary) dying."
+
         rm -f $tmp
         exit 1
     fi

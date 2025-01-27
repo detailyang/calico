@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,14 @@ import (
 	"fmt"
 	"reflect"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 const (
@@ -32,7 +33,7 @@ const (
 	IPPoolCRDName      = "ippools.crd.projectcalico.org"
 )
 
-func NewIPPoolClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResourceClient {
+func NewIPPoolClient(c kubernetes.Interface, r rest.Interface) K8sResourceClient {
 	return &customK8sResourceClient{
 		clientSet:       c,
 		restClient:      r,
@@ -82,4 +83,59 @@ func (c IPPoolv1v3Converter) ConvertFromK8s(inRes Resource) (Resource, error) {
 	ipp.Spec.NATOutgoingV1 = false
 
 	return ipp, nil
+}
+
+func IPPoolV3ToV1(kvp *model.KVPair) (*model.KVPair, error) {
+	v3res := kvp.Value.(*apiv3.IPPool)
+	_, cidr, err := cnet.ParseCIDR(v3res.Spec.CIDR)
+	if err != nil {
+		return nil, err
+	}
+	v1key := model.IPPoolKey{
+		CIDR: *cidr,
+	}
+	var ipipInterface string
+	var ipipMode encap.Mode
+	switch v3res.Spec.IPIPMode {
+	case apiv3.IPIPModeAlways:
+		ipipInterface = "tunl0"
+		ipipMode = encap.Always
+	case apiv3.IPIPModeCrossSubnet:
+		ipipInterface = "tunl0"
+		ipipMode = encap.CrossSubnet
+	default:
+		ipipInterface = ""
+		ipipMode = encap.Undefined
+	}
+
+	var vxlanMode encap.Mode
+	switch v3res.Spec.VXLANMode {
+	case apiv3.VXLANModeAlways:
+		vxlanMode = encap.Always
+	case apiv3.VXLANModeCrossSubnet:
+		vxlanMode = encap.CrossSubnet
+	default:
+		vxlanMode = encap.Undefined
+	}
+
+	if v3res.Spec.AssignmentMode == nil {
+		automatic := apiv3.Automatic
+		v3res.Spec.AssignmentMode = &automatic
+	}
+
+	return &model.KVPair{
+		Key: v1key,
+		Value: &model.IPPool{
+			CIDR:             *cidr,
+			IPIPInterface:    ipipInterface,
+			IPIPMode:         ipipMode,
+			VXLANMode:        vxlanMode,
+			Masquerade:       v3res.Spec.NATOutgoing,
+			IPAM:             !v3res.Spec.Disabled,
+			Disabled:         v3res.Spec.Disabled,
+			DisableBGPExport: v3res.Spec.DisableBGPExport,
+			AssignmentMode:   *v3res.Spec.AssignmentMode,
+		},
+		Revision: kvp.Revision,
+	}, nil
 }

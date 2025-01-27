@@ -15,19 +15,16 @@
 package clientv3_test
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"context"
-
-	"fmt"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -187,7 +184,6 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (kdd)", testutils.DatastoreK8
 })
 
 var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.DatastoreEtcdV3, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name1 := "node-1"
 	name2 := "node-2"
@@ -287,12 +283,16 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 					Mask: net.IPMask{255, 255, 255, 0},
 				},
 			}
-			_, _, err = c.IPAM().ClaimAffinity(ctx, affBlock, name1)
+			affinityCfg := ipam.AffinityConfig{
+				AffinityType: ipam.AffinityTypeHost,
+				Host:         name1,
+			}
+			_, _, err = c.IPAM().ClaimAffinity(ctx, affBlock, affinityCfg)
 			Expect(err).NotTo(HaveOccurred())
 
 			handle := "myhandle"
 			err = c.IPAM().AssignIP(ctx, ipam.AssignIPArgs{
-				IP:       cnet.IP{wepIp},
+				IP:       cnet.IP{IP: wepIp},
 				Hostname: name1,
 				HandleID: &handle,
 			})
@@ -398,7 +398,8 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 			list, err := be.List(
 				context.Background(),
 				model.BlockAffinityListOptions{
-					Host: name1,
+					Host:         name1,
+					AffinityType: string(ipam.AffinityTypeHost),
 				},
 				"",
 			)
@@ -430,7 +431,6 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 			Expect(hep).ShouldNot(BeNil())
 			Expect(err).NotTo(HaveOccurred())
 		})
-
 	})
 
 	DescribeTable("Node e2e CRUD tests",
@@ -444,7 +444,7 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 
 			By("Updating the Node before it is created")
 			_, outError := c.Nodes().Update(ctx, &libapiv3.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-node"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -525,7 +525,7 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 
 			By("Attempting to update the Node without a Creation Timestamp")
 			res, outError = c.Nodes().Update(ctx, &libapiv3.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-workload-endpoint"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -650,7 +650,6 @@ var _ = testutils.E2eDatastoreDescribe("Node tests (etcdv3)", testutils.Datastor
 			res, outError = c.Nodes().Get(ctx, name1, options.GetOptions{})
 			Expect(outError).ToNot(HaveOccurred())
 			Expect(res).To(MatchResourceWithStatus(libapiv3.KindNode, testutils.ExpectNoNamespace, name1, spec1, status))
-
 		},
 
 		// Test 1: Pass two fully populated NodeSpecs and expect the series of operations to succeed.

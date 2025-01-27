@@ -22,16 +22,11 @@ import (
 	"github.com/docopt/docopt-go"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
 	"github.com/projectcalico/calico/calicoctl/calicoctl/commands"
 	"github.com/projectcalico/calico/calicoctl/calicoctl/util"
 )
 
 func main() {
-	// Make sure the RNG is seeded.
-	seedrng.EnsureSeeded()
-
 	name, desc := util.NameAndDescription()
 	doc := fmt.Sprintf(`Usage:
   <BINARY_NAME> [options] <command> [<args>...]
@@ -40,7 +35,7 @@ func main() {
     replace      Replace a resource by file, directory or stdin.
     apply        Apply a resource by file, directory or stdin.  This creates a resource
                  if it does not exist, and replaces a resource if it does exists.
-    patch        Patch a pre-exisiting resource in place.
+    patch        Patch a preexisting resource in place.
     delete       Delete a resource identified by file, directory, stdin or resource type and
                  name.
     get          Get a resource identified by file, directory, stdin or resource type and

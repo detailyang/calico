@@ -22,7 +22,8 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/app-policy/policystore"
-	"github.com/projectcalico/calico/app-policy/proto"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 var (
@@ -97,8 +98,8 @@ func TestMatchHTTPMethods(t *testing.T) {
 	}{
 		{"empty", []string{}, "GET", true},
 		{"match", []string{"GET", "HEAD"}, "GET", true},
-		// HTTP methods are case sensitive. https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html
-		{"case sensitive", []string{"get", "HEAD"}, "GET", false},
+		// HTTP methods are case-sensitive. https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html
+		{"case-sensitive", []string{"get", "HEAD"}, "GET", false},
 		{"wildcard", []string{"*"}, "MADNESS", true},
 	}
 
@@ -351,10 +352,12 @@ func TestMatchRuleNamespaceSelectors(t *testing.T) {
 	}}
 
 	store := policystore.NewPolicyStore()
-	id := proto.NamespaceID{Name: "src"}
-	store.NamespaceByID[id] = &proto.NamespaceUpdate{Id: &id, Labels: map[string]string{"place": "src"}}
-	id = proto.NamespaceID{Name: "dst"}
-	store.NamespaceByID[id] = &proto.NamespaceUpdate{Id: &id, Labels: map[string]string{"place": "dst"}}
+	id := types.NamespaceID{Name: "src"}
+	protoID := types.NamespaceIDToProto(id)
+	store.NamespaceByID[id] = &proto.NamespaceUpdate{Id: protoID, Labels: map[string]string{"place": "src"}}
+	id = types.NamespaceID{Name: "dst"}
+	protoID = types.NamespaceIDToProto(id)
+	store.NamespaceByID[id] = &proto.NamespaceUpdate{Id: protoID, Labels: map[string]string{"place": "dst"}}
 	reqCache, err := NewRequestCache(store, req)
 	Expect(err).To(Succeed())
 	Expect(match(rule, reqCache, "")).To(BeTrue())
@@ -742,7 +745,7 @@ func TestMatchNet(t *testing.T) {
 			match: true,
 		},
 		{
-			title: "single v4 net no matcn",
+			title: "single v4 net no match",
 			nets:  []string{"192.168.0.0/16"},
 			ip:    "55.39.128.9",
 			match: false,

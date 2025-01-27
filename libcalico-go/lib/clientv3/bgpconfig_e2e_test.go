@@ -15,18 +15,16 @@
 package clientv3_test
 
 import (
+	"context"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	k8sv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"context"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	k8sv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -37,7 +35,6 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.DatastoreAll, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	nameDefault := "default"
 	name1 := "bgpconfig-1"
@@ -126,7 +123,7 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 
 			By("Updating the BGPConfiguration before it is created")
 			_, outError := c.BGPConfigurations().Update(ctx, &apiv3.BGPConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: nameDefault, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-workload-bgpconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: nameDefault, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       specDefault1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -207,7 +204,7 @@ var _ = testutils.E2eDatastoreDescribe("BGPConfiguration tests", testutils.Datas
 
 			By("Attempting to update the BGPConfiguration without a Creation Timestamp")
 			res, outError = c.BGPConfigurations().Update(ctx, &apiv3.BGPConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-bgpconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       specInfo,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())

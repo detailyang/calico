@@ -15,17 +15,15 @@
 package clientv3_test
 
 import (
+	"context"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"context"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -36,7 +34,6 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("Profile tests", testutils.DatastoreEtcdV3, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name1 := "profile-1"
 	name2 := "profile-2"
@@ -74,7 +71,7 @@ var _ = testutils.E2eDatastoreDescribe("Profile tests", testutils.DatastoreEtcdV
 
 			By("Updating the Profile before it is created")
 			_, outError = c.Profiles().Update(ctx, &apiv3.Profile{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-profile"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -157,7 +154,7 @@ var _ = testutils.E2eDatastoreDescribe("Profile tests", testutils.DatastoreEtcdV
 
 			By("Attempting to update the Profile without a Creation Timestamp")
 			res, outError = c.Profiles().Update(ctx, &apiv3.Profile{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-profile"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -307,7 +304,7 @@ var _ = testutils.E2eDatastoreDescribe("Profile tests", testutils.DatastoreEtcdV
 			// Fill in some fields to pass validation.
 			res.ResourceVersion = "fakerv"
 			res.CreationTimestamp = metav1.Now()
-			res.UID = "uid"
+			res.UID = uid
 
 			_, outError = c.Profiles().Update(ctx, res, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -337,7 +334,7 @@ var _ = testutils.E2eDatastoreDescribe("Profile tests", testutils.DatastoreEtcdV
 			outList, outError := c.Profiles().List(ctx, options.ListOptions{})
 			Expect(outError).NotTo(HaveOccurred())
 			Expect(outList.Items).To(HaveLen(1))
-			Expect(outList.Items[0].ResourceVersion).To(Equal("0"))
+			Expect(outList.Items[0].ResourceVersion).To(Equal("1"))
 			Expect(outList.Items[0].Spec.Ingress).To(ConsistOf(defaultAllowSpec.Ingress))
 			Expect(outList.Items[0].Spec.Egress).To(ConsistOf(defaultAllowSpec.Egress))
 			rev0 := outList.ResourceVersion

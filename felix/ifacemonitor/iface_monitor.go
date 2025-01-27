@@ -189,7 +189,7 @@ func (m *InterfaceMonitor) MonitorInterfaces() {
 
 func (m *InterfaceMonitor) isExcludedInterface(ifName string) bool {
 	for _, nameExp := range m.InterfaceExcludes {
-		if nameExp.Match([]byte(ifName)) {
+		if nameExp.MatchString(ifName) {
 			return true
 		}
 	}
@@ -221,6 +221,14 @@ func (m *InterfaceMonitor) handleNetlinkRouteUpdate(update netlink.RouteUpdate) 
 
 	if update.Dst == nil {
 		return
+	}
+	if update.Dst.IP.IsUnspecified() {
+		if ones, _ := update.Dst.Mask.Size(); ones == 0 {
+			// Default route, ignore.  These used to be filtered out by the
+			// nil check above, but the netlink library was changed to return
+			// an explicit unspecified CIDR in that case.
+			return
+		}
 	}
 
 	addr := update.Dst.IP.String()
@@ -285,7 +293,7 @@ func (m *InterfaceMonitor) storeAndNotifyLink(ifaceExists bool, link netlink.Lin
 	m.storeAndNotifyLinkInner(ifaceExists, newName, link)
 }
 
-func linkIsOperUp(link netlink.Link) bool {
+func LinkIsOperUp(link netlink.Link) bool {
 	// We need the operstate of the interface; this is carried in the IFF_RUNNING flag.  The
 	// IFF_UP flag contains the admin state, which doesn't tell us whether we can program routes
 	// etc.
@@ -315,7 +323,7 @@ func (m *InterfaceMonitor) storeAndNotifyLinkInner(ifaceExists bool, ifaceName s
 	}
 	newState := StateNotPresent
 	if ifaceExists {
-		if linkIsOperUp(link) {
+		if LinkIsOperUp(link) {
 			newState = StateUp
 		} else {
 			newState = StateDown

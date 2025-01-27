@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018,2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,12 +51,8 @@ func ConfigureEarlyLogging() {
 	// Log to stdout.  This prevents fluentd, for example, from interpreting all our logs as errors by default.
 	log.SetOutput(os.Stdout)
 
-	// Replace logrus' formatter with a custom one using our time format,
-	// shared with the Python code.
-	log.SetFormatter(&logutils.Formatter{Component: "felix"})
-
-	// Install a hook that adds file/line no information.
-	log.AddHook(&logutils.ContextHook{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("felix")
 
 	// First try the early-only environment variable.  Since the normal
 	// config processing doesn't know about that variable, normal config
@@ -144,10 +140,6 @@ func ConfigureLogging(configParams *config.Config) {
 	// hook above to fan out logs to multiple destinations.
 	log.SetOutput(&logutils.NullWriter{})
 
-	// Since we push our logs onto a second thread via a channel, we can disable the
-	// Logger's built-in mutex completely.
-	log.StandardLogger().SetNoLock()
-
 	// Do any deferred error logging.
 	if fileDirErr != nil {
 		log.WithError(fileDirErr).WithField("file", configParams.LogFilePath).
@@ -175,4 +167,13 @@ func getScreenDestination(configParams *config.Config, logLevel log.Level) *logu
 		configParams.DebugDisableLogDropping,
 		counterLogErrors,
 	)
+}
+
+// TODO(dimitrin): Once logrus is upgraded to 1.2.0+, replace all logutils Trace calls with
+// calls to logrus Trace.
+// Tracef prints the debug log if display is true.
+func Tracef(display bool, format string, args ...interface{}) {
+	if display {
+		log.Debugf(format, args...)
+	}
 }

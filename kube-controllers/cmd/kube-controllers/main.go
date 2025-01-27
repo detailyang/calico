@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,16 +19,11 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/pkg/profile"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
 	log "github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/client/pkg/v3/srv"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
@@ -37,23 +32,25 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
 
 	"github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/kube-controllers/pkg/config"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/controller"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/flannelmigration"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/loadbalancer"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/namespace"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/networkpolicy"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/node"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/pod"
 	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/serviceaccount"
+	"github.com/projectcalico/calico/kube-controllers/pkg/controllers/utils"
 	"github.com/projectcalico/calico/kube-controllers/pkg/status"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
+	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 // VERSION is filled out during the build process (using git describe output)
@@ -61,15 +58,9 @@ var (
 	VERSION    string
 	version    bool
 	statusFile string
-
-	// fipsModeEnabled enables FIPS 140-2 validated crypto mode.
-	fipsModeEnabled bool
 )
 
 func init() {
-	// Make sure the RNG is seeded.
-	seedrng.EnsureSeeded()
-
 	// Add a flag to check the version.
 	flag.BoolVar(&version, "version", false, "Display version")
 	flag.StringVar(&statusFile, "status-file", status.DefaultStatusFile, "File to write status information to")
@@ -83,7 +74,6 @@ func init() {
 	if err != nil {
 		log.WithError(err).Fatal("Failed to set klog logging configuration")
 	}
-	fipsModeEnabled = os.Getenv("FIPS_MODE_ENABLED") == "true"
 }
 
 func main() {
@@ -93,11 +83,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Configure log formatting.
-	log.SetFormatter(&logutils.Formatter{})
-
-	// Install a hook that adds file/line no information.
-	log.AddHook(&logutils.ContextHook{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("kube-controllers")
 
 	// Attempt to load configuration.
 	cfg := new(config.Config)
@@ -149,7 +136,6 @@ func main() {
 		select {
 		case <-initCtx.Done():
 			log.Fatal("Failed to initialize Calico datastore")
-			break
 		case <-time.After(5 * time.Second):
 			// Try to initialize again
 		}
@@ -164,6 +150,8 @@ func main() {
 		stop:        stop,
 		informers:   make([]cache.SharedIndexInformer, 0),
 	}
+
+	dataFeed := utils.NewDataFeed(calicoClient)
 
 	var runCfg config.RunConfig
 	// flannelmigration doesn't use the datastore config API
@@ -198,7 +186,7 @@ func main() {
 
 		// any subsequent changes trigger a restart
 		controllerCtrl.restart = cCtrlr.ConfigChan()
-		controllerCtrl.InitControllers(ctx, runCfg, k8sClientset, calicoClient)
+		controllerCtrl.InitControllers(ctx, runCfg, k8sClientset, calicoClient, dataFeed)
 	}
 
 	if cfg.DatastoreType == "etcdv3" {
@@ -219,8 +207,9 @@ func main() {
 		// Serve prometheus metrics.
 		log.Infof("Starting Prometheus metrics server on port %d", runCfg.PrometheusPort)
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.PrometheusPort), nil)
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
+			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.PrometheusPort), mux)
 			if err != nil {
 				log.WithError(err).Fatal("Failed to serve prometheus metrics")
 			}
@@ -228,19 +217,11 @@ func main() {
 	}
 
 	if runCfg.DebugProfilePort != 0 {
-		// Run a webserver to expose memory profiling.
-		setPathOption := profile.ProfilePath("/profiles")
-		defer profile.Start(profile.CPUProfile, profile.MemProfile, setPathOption).Stop()
-		go func() {
-			err := http.ListenAndServe(fmt.Sprintf(":%d", runCfg.DebugProfilePort), nil)
-			if err != nil {
-				log.WithError(err).Fatal("Failed to start debug profiling")
-			}
-		}()
+		debugserver.StartDebugPprofServer("0.0.0.0", int(runCfg.DebugProfilePort))
 	}
 
 	// Run the controllers. This runs until a config change triggers a restart
-	controllerCtrl.RunControllers()
+	controllerCtrl.RunControllers(dataFeed, runCfg)
 
 	// Shut down compaction, healthChecks, and configController
 	cancel()
@@ -359,7 +340,7 @@ func getClients(kubeconfig string) (*kubernetes.Clientset, client.Interface, err
 
 	// Now build the Kubernetes client, we support in-cluster config and kubeconfig
 	// as means of configuring the client.
-	k8sconfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	k8sconfig, err := winutils.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build kubernetes client config: %s", err)
 	}
@@ -416,7 +397,7 @@ func newEtcdV3Client() (*clientv3.Client, error) {
 		return nil, err
 	}
 
-	baseTLSConfig := tls.NewTLSConfig(fipsModeEnabled)
+	baseTLSConfig := tls.NewTLSConfig()
 	tlsClient.MaxVersion = baseTLSConfig.MaxVersion
 	tlsClient.MinVersion = baseTLSConfig.MinVersion
 	tlsClient.CipherSuites = baseTLSConfig.CipherSuites
@@ -447,12 +428,13 @@ type controllerControl struct {
 	informers   []cache.SharedIndexInformer
 }
 
-func (cc *controllerControl) InitControllers(ctx context.Context, cfg config.RunConfig, k8sClientset *kubernetes.Clientset, calicoClient client.Interface) {
+func (cc *controllerControl) InitControllers(ctx context.Context, cfg config.RunConfig, k8sClientset *kubernetes.Clientset, calicoClient client.Interface, dataFeed *utils.DataFeed) {
 	// Create a shared informer factory to allow cache sharing between controllers monitoring the
 	// same resource.
 	factory := informers.NewSharedInformerFactory(k8sClientset, 0)
 	podInformer := factory.Core().V1().Pods().Informer()
 	nodeInformer := factory.Core().V1().Nodes().Informer()
+	serviceInformer := factory.Core().V1().Services().Informer()
 
 	if cfg.Controllers.WorkloadEndpoint != nil {
 		podController := pod.NewPodController(ctx, k8sClientset, calicoClient, *cfg.Controllers.WorkloadEndpoint, podInformer)
@@ -469,13 +451,19 @@ func (cc *controllerControl) InitControllers(ctx context.Context, cfg config.Run
 		cc.controllers["NetworkPolicy"] = policyController
 	}
 	if cfg.Controllers.Node != nil {
-		nodeController := node.NewNodeController(ctx, k8sClientset, calicoClient, *cfg.Controllers.Node, nodeInformer, podInformer)
+		nodeController := node.NewNodeController(ctx, k8sClientset, calicoClient, *cfg.Controllers.Node, nodeInformer, podInformer, dataFeed)
 		cc.controllers["Node"] = nodeController
 		cc.registerInformers(podInformer, nodeInformer)
 	}
 	if cfg.Controllers.ServiceAccount != nil {
 		serviceAccountController := serviceaccount.NewServiceAccountController(ctx, k8sClientset, calicoClient, *cfg.Controllers.ServiceAccount)
 		cc.controllers["ServiceAccount"] = serviceAccountController
+	}
+
+	if cfg.Controllers.LoadBalancer != nil {
+		loadBalancerController := loadbalancer.NewLoadBalancerController(k8sClientset, calicoClient, *cfg.Controllers.LoadBalancer, serviceInformer, dataFeed)
+		cc.controllers["LoadBalancer"] = loadBalancerController
+		cc.registerInformers(serviceInformer)
 	}
 }
 
@@ -497,7 +485,7 @@ func (cc *controllerControl) registerInformers(infs ...cache.SharedIndexInformer
 }
 
 // Runs all the controllers and blocks until we get a restart.
-func (cc *controllerControl) RunControllers() {
+func (cc *controllerControl) RunControllers(dataFeed *utils.DataFeed, cfg config.RunConfig) {
 	// Start any registered informers.
 	for _, inf := range cc.informers {
 		log.WithField("informer", inf).Info("Starting informer")
@@ -508,6 +496,11 @@ func (cc *controllerControl) RunControllers() {
 	for controllerType, c := range cc.controllers {
 		log.WithField("ControllerType", controllerType).Info("Starting controller")
 		go c.Run(cc.stop)
+	}
+
+	if cfg.Controllers.Node != nil || cfg.Controllers.LoadBalancer != nil {
+		// Start dataFeed for controllers that need it
+		dataFeed.Start()
 	}
 
 	// Block until we are cancelled, or get a new configuration and need to restart

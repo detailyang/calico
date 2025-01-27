@@ -30,20 +30,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/golang/snappy"
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
 	"github.com/projectcalico/calico/libcalico-go/lib/writelogger"
-	"github.com/projectcalico/calico/typha/pkg/promutils"
-
 	"github.com/projectcalico/calico/typha/pkg/buildinfo"
 	"github.com/projectcalico/calico/typha/pkg/jitter"
+	"github.com/projectcalico/calico/typha/pkg/promutils"
 	"github.com/projectcalico/calico/typha/pkg/snapcache"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 	"github.com/projectcalico/calico/typha/pkg/tlsutils"
@@ -101,6 +99,7 @@ const (
 	defaultBatchingAgeThreshold           = 100 * time.Millisecond
 	defaultPingInterval                   = 10 * time.Second
 	defaultWriteTimeout                   = 120 * time.Second
+	defaultHandshakeTimeout               = 10 * time.Second
 	defaultDropInterval                   = 1 * time.Second
 	defaultShutdownTimeout                = 300 * time.Second
 	defaultMaxConns                       = math.MaxInt32
@@ -140,6 +139,7 @@ type Config struct {
 	MinBatchingAgeThreshold        time.Duration
 	PingInterval                   time.Duration
 	PongTimeout                    time.Duration
+	HandshakeTimeout               time.Duration
 	WriteTimeout                   time.Duration
 	DropInterval                   time.Duration
 	ShutdownTimeout                time.Duration
@@ -156,9 +156,6 @@ type Config struct {
 	// DebugLogWrites tells the server to wrap each connection with a Writer that
 	// logs every write.  Intended only for use in tests!
 	DebugLogWrites bool
-
-	// FIPSModeEnabled Enables FIPS 140-2 verified crypto mode.
-	FIPSModeEnabled bool
 }
 
 const (
@@ -216,6 +213,13 @@ func (c *Config) ApplyDefaults() {
 			"default": defaultTimeout,
 		}).Info("PongTimeout < PingInterval * 2; Defaulting PongTimeout.")
 		c.PongTimeout = defaultTimeout
+	}
+	if c.HandshakeTimeout <= 0 {
+		log.WithFields(log.Fields{
+			"value":   c.HandshakeTimeout,
+			"default": defaultHandshakeTimeout,
+		}).Info("Defaulting HandshakeTimeout.")
+		c.HandshakeTimeout = defaultHandshakeTimeout
 	}
 	if c.WriteTimeout <= 0 {
 		log.WithField("default", defaultWriteTimeout).Info("Defaulting write timeout.")
@@ -334,10 +338,7 @@ func (s *Server) serve(cxt context.Context) {
 	)
 	if s.config.requiringTLS() {
 		pwd, _ := os.Getwd()
-		logCxt.WithFields(log.Fields{
-			"pwd":             pwd,
-			"fipsModeEnabled": s.config.FIPSModeEnabled,
-		}).Info("Opening TLS listen socket")
+		logCxt.WithField("pwd", pwd).Info("Opening TLS listen socket")
 		cert, tlsErr := tls.LoadX509KeyPair(s.config.CertFile, s.config.KeyFile)
 		if tlsErr != nil {
 			logCxt.WithFields(log.Fields{
@@ -345,7 +346,7 @@ func (s *Server) serve(cxt context.Context) {
 				"keyFile":  s.config.KeyFile,
 			}).WithError(tlsErr).Panic("Failed to load certificate and key")
 		}
-		tlsConfig := calicotls.NewTLSConfig(s.config.FIPSModeEnabled)
+		tlsConfig := calicotls.NewTLSConfig()
 		tlsConfig.Certificates = []tls.Certificate{cert}
 
 		// Arrange for server to verify the clients' certificates.
@@ -419,39 +420,10 @@ func (s *Server) serve(cxt context.Context) {
 		}
 
 		logCxt.Infof("Accepted from %s", conn.RemoteAddr())
-		var tcpConn *net.TCPConn
-		if s.config.requiringTLS() {
-			// Doing TLS, we must do the handshake...
-			tlsConn := conn.(*tls.Conn)
-			logCxt.Debug("TLS connection")
-			err = tlsConn.Handshake()
-			if err != nil {
-				logCxt.WithError(err).Error("TLS handshake error")
-				err = conn.Close()
-				if err != nil {
-					logCxt.WithError(err).Warning("Error closing failed TLS connection")
-				}
-				continue
-			}
-			state := tlsConn.ConnectionState()
-			for _, v := range state.PeerCertificates {
-				bytes, _ := x509.MarshalPKIXPublicKey(v.PublicKey)
-				logCxt.Debugf("%#v", bytes)
-				logCxt.Debugf("%#v", v.Subject)
-				logCxt.Debugf("%#v", v.URIs)
-			}
-			tcpConn, _ = tlsConn.NetConn().(*net.TCPConn)
-		} else {
-			tcpConn, _ = conn.(*net.TCPConn)
-		}
 
 		if s.config.WriteBufferSize != 0 {
-			if err := tcpConn.SetWriteBuffer(s.config.WriteBufferSize); err != nil { // Covers the nil case.
-				// Only logging for now, we only use this option in tests.
-				logCxt.WithError(err).Warn("Failed to set write buffer size.")
-			} else {
-				logCxt.WithField("size", s.config.WriteBufferSize).Info("Set connection write buffer size.")
-			}
+			// Try to set the write buffer size.  Only used in tests for now.
+			setWriteBufferSizeBestEffort(conn, s.config.WriteBufferSize)
 		}
 
 		connID := s.nextConnID
@@ -502,6 +474,26 @@ func (s *Server) serve(cxt context.Context) {
 			s.discardConnection(connection)
 			s.Finished.Done()
 		}()
+	}
+}
+
+func setWriteBufferSizeBestEffort(conn net.Conn, size int) {
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		// TLS connection: need to get the underlying socket to adjust the
+		// write buffer size.
+		conn = tlsConn.NetConn()
+	}
+
+	tcpConn, ok := conn.(interface{ SetWriteBuffer(bytes int) error })
+	if !ok {
+		log.WithField("conn", conn).Warn(
+			"Failed to get underlying TCP connection to set write buffer size.")
+		return
+	}
+
+	if err := tcpConn.SetWriteBuffer(size); err != nil {
+		log.WithError(err).Warn("Failed to set write buffer size.")
+		return
 	}
 }
 
@@ -878,10 +870,9 @@ func (h *connection) readFromClient(logCxt *log.Entry) {
 }
 
 // waitForMessage blocks, waiting for a message on the h.readC channel.  It imposes a timeout.
-func (h *connection) waitForMessage(logCxt *log.Entry) (interface{}, error) {
-	// Read the hello message from the client.
-	cxt, cancel := context.WithDeadline(h.cxt, time.Now().Add(60*time.Second))
-	defer cancel()
+func (h *connection) waitForMessage(logCxt *log.Entry, timeout time.Duration) (interface{}, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case msg := <-h.readC:
 		if msg == nil {
@@ -890,15 +881,19 @@ func (h *connection) waitForMessage(logCxt *log.Entry) (interface{}, error) {
 		}
 		logCxt.WithField("msg", msg).Debug("Received message from client.")
 		return msg, nil
-	case <-cxt.Done():
-		logCxt.Info("Asked to stop by context.")
+	case <-timer.C:
+		// Error gets logged by caller.
+		return nil, fmt.Errorf("timed out waiting for message from client")
+	case <-h.cxt.Done():
+		// Error gets logged by caller.
 		return nil, h.cxt.Err()
 	}
 }
 
 func (h *connection) doHandshake() error {
-	// Read the client's hello message.
-	msg, err := h.waitForMessage(h.logCxt)
+	// Read the client's hello message.  Note: for TLS connections this
+	// first read is where the TLS handshake happens.
+	msg, err := h.waitForMessage(h.logCxt, h.config.HandshakeTimeout)
 	if err != nil {
 		h.logCxt.WithError(err).Warn("Failed to read client hello.")
 		return err
@@ -975,9 +970,11 @@ func (h *connection) restartEncodingIfSupported(message string) error {
 }
 
 func (h *connection) waitForAckAndRestartEncoder() error {
-	// Wait until the client ACKs.  This avoids sending compressed data that might get misinterpreted
-	// by the gob decoder.
-	msg, err := h.waitForMessage(h.logCxt)
+	// Wait until the client ACKs.  This avoids sending compressed data that
+	// might get misinterpreted by the gob decoder.  We use the pong timeout
+	// here because it has a very similar purpose; we sent something, and
+	// we're waiting for the response.
+	msg, err := h.waitForMessage(h.logCxt, h.config.PongTimeout)
 	if err != nil {
 		h.logCxt.WithError(err).Warn("Failed to read client ACK.")
 		return err
@@ -1042,7 +1039,7 @@ func (h *connection) sendMsg(msg interface{}) error {
 
 func (h *connection) maybeResetWriteTimeout() error {
 	now := time.Now()
-	// Under heavy load, updating the timeout for every message seemed to cause noticible overhead,
+	// Under heavy load, updating the timeout for every message seemed to cause noticeable overhead,
 	// so we add a 10% buffer and then only reset it when it drops too low.
 	if h.currentWriteDeadline.Before(now.Add(h.config.WriteTimeout)) {
 		newWriteDeadline := now.Add(h.config.WriteTimeout * 110 / 100)

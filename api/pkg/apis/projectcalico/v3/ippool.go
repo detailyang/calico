@@ -85,29 +85,34 @@ type IPPoolSpec struct {
 	// AllowedUse controls what the IP pool will be used for.  If not specified or empty, defaults to
 	// ["Tunnel", "Workload"] for back-compatibility
 	AllowedUses []IPPoolAllowedUse `json:"allowedUses,omitempty" validate:"omitempty"`
+
+	// Determines the mode how IP addresses should be assigned from this pool
+	// +optional
+	AssignmentMode *AssignmentMode `json:"assignmentMode,omitempty" validate:"omitempty,assignmentMode"`
 }
 
 type IPPoolAllowedUse string
 
 const (
-	IPPoolAllowedUseWorkload IPPoolAllowedUse = "Workload"
-	IPPoolAllowedUseTunnel                    = "Tunnel"
+	IPPoolAllowedUseWorkload     IPPoolAllowedUse = "Workload"
+	IPPoolAllowedUseTunnel       IPPoolAllowedUse = "Tunnel"
+	IPPoolAllowedUseLoadBalancer IPPoolAllowedUse = "LoadBalancer"
 )
 
 type VXLANMode string
 
 const (
 	VXLANModeNever       VXLANMode = "Never"
-	VXLANModeAlways                = "Always"
-	VXLANModeCrossSubnet           = "CrossSubnet"
+	VXLANModeAlways      VXLANMode = "Always"
+	VXLANModeCrossSubnet VXLANMode = "CrossSubnet"
 )
 
 type IPIPMode string
 
 const (
 	IPIPModeNever       IPIPMode = "Never"
-	IPIPModeAlways               = "Always"
-	IPIPModeCrossSubnet          = "CrossSubnet"
+	IPIPModeAlways      IPIPMode = "Always"
+	IPIPModeCrossSubnet IPIPMode = "CrossSubnet"
 )
 
 // The following definitions are only used for APIv1 backwards compatibility.
@@ -116,8 +121,16 @@ type EncapMode string
 
 const (
 	Undefined   EncapMode = ""
-	Always                = "always"
-	CrossSubnet           = "cross-subnet"
+	Always      EncapMode = "always"
+	CrossSubnet EncapMode = "cross-subnet"
+)
+
+// +kubebuilder:validation:Enum=Automatic;Manual
+type AssignmentMode string
+
+const (
+	Automatic AssignmentMode = "Automatic"
+	Manual    AssignmentMode = "Manual"
 )
 
 const DefaultMode = Always

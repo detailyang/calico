@@ -21,9 +21,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -44,18 +43,24 @@ var _ = testutils.E2eDatastoreDescribe("FelixConfiguration tests", testutils.Dat
 	hostString := "localhost"
 	fipDisabled := apiv3.FloatingIPsDisabled
 	fipEnabled := apiv3.FloatingIPsEnabled
+	ctlbEnabled := apiv3.BPFConnectTimeLBEnabled
+	hostNetworkedNATDisabled := apiv3.BPFHostNetworkedNATDisabled
 	spec1 := apiv3.FelixConfigurationSpec{
-		UseInternalDataplaneDriver: &ptrTrue,
-		DataplaneDriver:            "test-dataplane-driver1",
-		MetadataPort:               &ptrInt1,
-		FloatingIPs:                &fipDisabled,
+		UseInternalDataplaneDriver:     &ptrTrue,
+		DataplaneDriver:                "test-dataplane-driver1",
+		MetadataPort:                   &ptrInt1,
+		FloatingIPs:                    &fipDisabled,
+		BPFConnectTimeLoadBalancing:    &ctlbEnabled,
+		BPFHostNetworkedNATWithoutCTLB: &hostNetworkedNATDisabled,
 	}
 	spec2 := apiv3.FelixConfigurationSpec{
-		UseInternalDataplaneDriver: &ptrFalse,
-		DataplaneDriver:            "test-dataplane-driver2",
-		HealthHost:                 &hostString,
-		HealthPort:                 &ptrInt2,
-		FloatingIPs:                &fipEnabled,
+		UseInternalDataplaneDriver:     &ptrFalse,
+		DataplaneDriver:                "test-dataplane-driver2",
+		HealthHost:                     &hostString,
+		HealthPort:                     &ptrInt2,
+		FloatingIPs:                    &fipEnabled,
+		BPFConnectTimeLoadBalancing:    &ctlbEnabled,
+		BPFHostNetworkedNATWithoutCTLB: &hostNetworkedNATDisabled,
 	}
 
 	DescribeTable("FelixConfiguration e2e CRUD tests",
@@ -69,7 +74,7 @@ var _ = testutils.E2eDatastoreDescribe("FelixConfiguration tests", testutils.Dat
 
 			By("Updating the FelixConfiguration before it is created")
 			_, outError := c.FelixConfigurations().Update(ctx, &apiv3.FelixConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-felixconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -150,7 +155,7 @@ var _ = testutils.E2eDatastoreDescribe("FelixConfiguration tests", testutils.Dat
 
 			By("Attempting to update the FelixConfiguration without a Creation Timestamp")
 			res, outError = c.FelixConfigurations().Update(ctx, &apiv3.FelixConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-felixconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -165,6 +170,24 @@ var _ = testutils.E2eDatastoreDescribe("FelixConfiguration tests", testutils.Dat
 			Expect(outError).To(HaveOccurred())
 			Expect(res).To(BeNil())
 			Expect(outError.Error()).To(Equal("error with field Metadata.UID = '' (field must be set for an Update request)"))
+
+			By("Attempting to update the FelixConfiguration the wrong UID")
+			res, outError = c.FelixConfigurations().Update(ctx, &apiv3.FelixConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              name1,
+					ResourceVersion:   "1234",
+					CreationTimestamp: metav1.Now(),
+					UID:               uid,
+				},
+				Spec: spec1,
+			}, options.SetOptions{})
+			Expect(outError).To(HaveOccurred())
+			if config.Spec.DatastoreType == apiconfig.Kubernetes {
+				Expect(outError.Error()).To(ContainSubstring("Precondition failed: UID in precondition"))
+			} else {
+				// etcd data store produces a different error message.
+				Expect(outError.Error()).To(ContainSubstring("update conflict: FelixConfiguration(felixconfig-1)"))
+			}
 
 			// Track the version of the updated name1 data.
 			rv1_2 := res1.ResourceVersion

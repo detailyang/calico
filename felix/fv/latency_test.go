@@ -23,14 +23,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/projectcalico/calico/felix/fv/connectivity"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
+	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
@@ -53,10 +51,9 @@ func (c latencyConfig) workloadIP(workloadIdx int) string {
 }
 
 var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datastore", func() {
-
 	var (
 		etcd   *containers.Container
-		felix  *infrastructure.Felix
+		tc     infrastructure.TopologyContainers
 		client client.Interface
 		infra  infrastructure.DatastoreInfra
 
@@ -65,14 +62,14 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 
 	BeforeEach(func() {
 		topologyOptions := infrastructure.DefaultTopologyOptions()
-		topologyOptions.EnableIPv6 = true
+		topologyOptions.IPIPEnabled = false
 		topologyOptions.ExtraEnvVars["FELIX_BPFLOGLEVEL"] = "off" // For best perf.
 
-		felix, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
-		_ = felix.GetFelixPID()
+		tc, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
+		_ = tc.Felixes[0].GetFelixPID()
 
 		var err error
-		resultsFile, err = os.OpenFile("latency.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+		resultsFile, err = os.OpenFile("latency.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 		Expect(err).NotTo(HaveOccurred())
 	})
 
@@ -83,9 +80,13 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 		}
 
 		if CurrentGinkgoTestDescription().Failed {
-			felix.Exec("iptables-save", "-c")
+			if NFTMode() {
+				logNFTDiags(tc.Felixes[0])
+			} else {
+				tc.Felixes[0].Exec("iptables-save", "-c")
+			}
 		}
-		felix.Stop()
+		tc.Stop()
 
 		if CurrentGinkgoTestDescription().Failed {
 			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
@@ -122,7 +123,7 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 
 				ports = "3000"
 				w[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"w"+iiStr,
 					"fv",
 					c.workloadIP(ii),
@@ -196,16 +197,15 @@ var _ = Context("_BPF-SAFE_ Latency tests with initialized Felix and etcd datast
 					// The all() selector should now map to an IP set with 10,002 IPs in it.
 					if os.Getenv("FELIX_FV_ENABLE_BPF") == "true" {
 						Eventually(func() int {
-							return getTotalBPFIPSetMembers(felix)
+							return getTotalBPFIPSetMembers(tc.Felixes[0])
+						}, "10s", "1000ms").Should(Equal(10002))
+					} else if NFTMode() {
+						Eventually(func() int {
+							return tc.Felixes[0].NumNFTSetMembers(c.ipVersion, utils.NFTSetNameForSelector(c.ipVersion, sourceSelector))
 						}, "10s", "1000ms").Should(Equal(10002))
 					} else {
 						ipSetName := utils.IPSetNameForSelector(c.ipVersion, sourceSelector)
-						Eventually(func() int {
-							return getNumIPSetMembers(
-								felix.Container,
-								ipSetName,
-							)
-						}, "100s", "1000ms").Should(Equal(10002))
+						Eventually(tc.Felixes[0].IPSetSizeFn(ipSetName), "100s", "1000ms").Should(Equal(10002))
 					}
 				})
 

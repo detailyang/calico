@@ -1,6 +1,6 @@
 //go:build fvtests
 
-// Copyright (c) 2019-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,33 +29,37 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-	"github.com/projectcalico/calico/pod2daemon/binder"
+	"google.golang.org/grpc/resolver"
+	googleproto "google.golang.org/protobuf/proto"
 
 	"github.com/projectcalico/calico/felix/dataplane/mock"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	"github.com/projectcalico/calico/felix/proto"
-
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	"github.com/projectcalico/calico/libcalico-go/lib/selector"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	"github.com/projectcalico/calico/pod2daemon/binder"
 )
+
+func init() {
+	resolver.SetDefaultScheme("passthrough")
+}
 
 var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 	var (
 		etcd              *containers.Container
-		felix             *infrastructure.Felix
+		tc                infrastructure.TopologyContainers
 		calicoClient      client.Interface
 		infra             infrastructure.DatastoreInfra
 		w                 [3]*workload.Workload
@@ -78,13 +82,13 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 		// options.ExtraEnvVars["FELIX_DebugDisableLogDropping"] = "true"
 		// options.FelixLogSeverity = "debug"
 		options.ExtraVolumes[tempDir] = "/var/run/calico/policysync"
-		felix, etcd, calicoClient, infra = infrastructure.StartSingleNodeEtcdTopology(options)
+		tc, etcd, calicoClient, infra = infrastructure.StartSingleNodeEtcdTopology(options)
 		infrastructure.CreateDefaultProfile(calicoClient, "default", map[string]string{"default": ""}, "default == ''")
 
 		// Create three workloads, using that profile.
 		for ii := range w {
 			iiStr := strconv.Itoa(ii)
-			w[ii] = workload.Run(felix, "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
+			w[ii] = workload.Run(tc.Felixes[0], "w"+iiStr, "default", "10.65.0.1"+iiStr, "8055", "tcp")
 			w[ii].WorkloadEndpoint.Spec.Endpoint = "eth0"
 			w[ii].WorkloadEndpoint.Spec.Orchestrator = "k8s"
 			w[ii].WorkloadEndpoint.Spec.Pod = "fv-pod-" + iiStr
@@ -98,7 +102,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 		for ii := range w {
 			w[ii].Stop()
 		}
-		felix.Stop()
+		tc.Stop()
 
 		if CurrentGinkgoTestDescription().Failed {
 			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
@@ -212,7 +216,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 					opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 					opts = append(opts, grpc.WithDialer(unixDialer))
 					var conn *grpc.ClientConn
-					conn, err = grpc.Dial(hostWlSocketPath[i], opts...)
+					conn, err = grpc.NewClient(hostWlSocketPath[i], opts...)
 					Expect(err).NotTo(HaveOccurred())
 					wlClient := proto.NewPolicySyncClient(conn)
 					return conn, wlClient
@@ -225,7 +229,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 						// Use the fact that anything we exec inside the Felix container runs as root to fix the
 						// permissions on the socket so the test process can connect.
 						Eventually(hostWlSocketPath[i], "3s").Should(BeAnExistingFile())
-						felix.Exec("chmod", "a+rw", containerWlSocketPath[i])
+						tc.Felixes[0].Exec("chmod", "a+rw", containerWlSocketPath[i])
 						wlConn[i], wlClient[i] = createWorkloadConn(i)
 					}
 				})
@@ -259,7 +263,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 					It("workload 0's client should receive correct updates", func() {
 						Eventually(mockWlClient[0].InSync).Should(BeTrue())
-						Eventually(mockWlClient[0].ActiveProfiles).Should(Equal(set.From(proto.ProfileID{Name: "default"})))
+						Eventually(mockWlClient[0].ActiveProfiles).Should(Equal(set.From(types.ProfileID{Name: "default"})))
 						// Should only hear about our own workload.
 						Eventually(mockWlClient[0].EndpointToPolicyOrder).Should(Equal(
 							map[string][]mock.TierInfo{"k8s/fv/fv-pod-0/eth0": {}}))
@@ -267,7 +271,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 					It("workload 1's client should receive correct updates", func() {
 						Eventually(mockWlClient[1].InSync).Should(BeTrue())
-						Eventually(mockWlClient[1].ActiveProfiles).Should(Equal(set.From(proto.ProfileID{Name: "default"})))
+						Eventually(mockWlClient[1].ActiveProfiles).Should(Equal(set.From(types.ProfileID{Name: "default"})))
 						// Should only hear about our own workload.
 						Eventually(mockWlClient[1].EndpointToPolicyOrder).Should(Equal(
 							map[string][]mock.TierInfo{"k8s/fv/fv-pod-1/eth0": {}}))
@@ -303,7 +307,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 								}
 
 								if wlIdx != 2 {
-									policyID := proto.PolicyID{Name: "default.policy-0", Tier: "default"}
+									policyID := types.PolicyID{Name: "default.policy-0", Tier: "default"}
 									Eventually(mockWlClient[wlIdx].ActivePolicies, waitTime).Should(Equal(set.From(policyID)))
 								}
 
@@ -311,7 +315,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 								Expect(err).NotTo(HaveOccurred())
 
 								if wlIdx != 2 {
-									Eventually(mockWlClient[wlIdx].ActivePolicies, waitTime).Should(Equal(set.New[proto.PolicyID]()))
+									Eventually(mockWlClient[wlIdx].ActivePolicies, waitTime).Should(Equal(set.New[types.PolicyID]()))
 								}
 							}
 						}
@@ -332,7 +336,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 					Context("after adding a policy that applies to workload 0 only", func() {
 						var (
 							policy   *api.GlobalNetworkPolicy
-							policyID proto.PolicyID
+							policyID types.PolicyID
 						)
 
 						BeforeEach(func() {
@@ -361,7 +365,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 							policy, err = calicoClient.GlobalNetworkPolicies().Create(ctx, policy, utils.NoOptions)
 							Expect(err).NotTo(HaveOccurred())
 
-							policyID = proto.PolicyID{Name: "default.policy-0", Tier: "default"}
+							policyID = types.PolicyID{Name: "default.policy-0", Tier: "default"}
 						})
 
 						It("should be sent to workload 0 only", func() {
@@ -375,26 +379,26 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 									IngressPolicyNames: []string{"default.policy-0"},
 								}}}))
 
-							Consistently(mockWlClient[1].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
-							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
+							Consistently(mockWlClient[1].ActivePolicies).Should(Equal(set.New[types.PolicyID]()))
+							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[types.PolicyID]()))
 						})
 
 						It("should be correctly mapped to proto policy", func() {
 							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.From(
 								policyID,
 							)))
-							policy := mockWlClient[0].ActivePolicy(policyID)
+							protoPol := mockWlClient[0].ActivePolicy(policyID)
 							// The rule IDs are fairly random hashes, check they're there but
 							// ignore them for the comparison.
-							for _, r := range policy.InboundRules {
+							for _, r := range protoPol.InboundRules {
 								Expect(r.RuleId).NotTo(Equal(""))
 								r.RuleId = ""
 							}
-							for _, r := range policy.OutboundRules {
+							for _, r := range protoPol.OutboundRules {
 								Expect(r.RuleId).NotTo(Equal(""))
 								r.RuleId = ""
 							}
-							Expect(policy).To(Equal(
+							Expect(googleproto.Equal(protoPol,
 								&proto.Policy{
 									Namespace: "", // Global policy has no namespace
 									InboundRules: []*proto.Rule{
@@ -408,7 +412,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 												Selector: "foo == 'bar'",
 											},
 											HttpMatch: &proto.HTTPMatch{Methods: []string{"GET"},
-												Paths: []*proto.HTTPMatch_PathMatch{{&proto.HTTPMatch_PathMatch_Exact{Exact: "/path"}}},
+												Paths: []*proto.HTTPMatch_PathMatch{{PathMatch: &proto.HTTPMatch_PathMatch_Exact{Exact: "/path"}}},
 											},
 										},
 									},
@@ -417,8 +421,8 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 											Action: "allow",
 										},
 									},
-								},
-							))
+									OriginalSelector: selector.Normalise(policy.Spec.Selector),
+								})).To(BeTrue())
 						})
 
 						It("should handle a deletion", func() {
@@ -429,7 +433,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 							_, err := calicoClient.GlobalNetworkPolicies().Delete(ctx, "policy-0", options.DeleteOptions{})
 							Expect(err).NotTo(HaveOccurred())
 
-							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
+							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[types.PolicyID]()))
 						})
 
 						It("should handle a change of selector", func() {
@@ -447,7 +451,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 							Eventually(mockWlClient[0].EndpointToPolicyOrder).Should(Equal(
 								map[string][]mock.TierInfo{"k8s/fv/fv-pod-0/eth0": {}}))
-							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
+							Eventually(mockWlClient[0].ActivePolicies).Should(Equal(set.New[types.PolicyID]()))
 
 							By("Updating workload 1 to make the policy active")
 							Eventually(mockWlClient[1].ActivePolicies).Should(Equal(set.From(policyID)))
@@ -458,13 +462,13 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 									IngressPolicyNames: []string{"default.policy-0"},
 								}}}))
 
-							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[proto.PolicyID]()))
+							Consistently(mockWlClient[2].ActivePolicies).Should(Equal(set.New[types.PolicyID]()))
 						})
 
 						It("should handle a change of profiles", func() {
 							// Make sure the initial update makes it through or we might get a
 							// false positive.
-							defProfID := proto.ProfileID{Name: "default"}
+							defProfID := types.ProfileID{Name: "default"}
 							Eventually(mockWlClient[0].ActiveProfiles).Should(Equal(set.From(
 								defProfID,
 							)))
@@ -478,7 +482,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 							Expect(err).NotTo(HaveOccurred())
 
 							By("Sending through an endpoint update and policy remove/update")
-							notDefProfID := proto.ProfileID{Name: "notdefault"}
+							notDefProfID := types.ProfileID{Name: "notdefault"}
 							Eventually(mockWlClient[0].EndpointToProfiles).Should(Equal(map[string][]string{
 								"k8s/fv/fv-pod-0/eth0": {"notdefault"}}))
 							Eventually(mockWlClient[0].ActiveProfiles).Should(Equal(set.From(notDefProfID)))
@@ -489,7 +493,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 					})
 
 					Context("after adding a service account as profile", func() {
-						var saID proto.ServiceAccountID
+						var saID types.ServiceAccountID
 
 						BeforeEach(func() {
 							log.Info("Adding Service Account Profile")
@@ -508,18 +512,20 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 						It("should sync service account to each workload", func() {
 							for _, c := range mockWlClient {
-								Eventually(c.ServiceAccounts).Should(Equal(map[proto.ServiceAccountID]*proto.ServiceAccountUpdate{
-									saID: {
-										Id:     &saID,
+								Eventually(func() bool {
+									v := c.ServiceAccounts()
+									equal := googleproto.Equal(v[saID], &proto.ServiceAccountUpdate{
+										Id:     types.ServiceAccountIDToProto(saID),
 										Labels: map[string]string{"key.1": "value.1", "key_2": "value-2"},
-									},
-								}))
+									})
+									return equal
+								}).Should(BeTrue())
 							}
 						})
 					})
 
 					Context("after adding a namespace as profile", func() {
-						var nsID proto.NamespaceID
+						var nsID types.NamespaceID
 
 						BeforeEach(func() {
 							log.Info("Adding Namespace Profile")
@@ -537,12 +543,14 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 
 						It("should sync namespace to each workload", func() {
 							for _, c := range mockWlClient {
-								Eventually(c.Namespaces).Should(Equal(map[proto.NamespaceID]*proto.NamespaceUpdate{
-									nsID: {
-										Id:     &nsID,
+								Eventually(func() bool {
+									v := c.Namespaces()
+									equal := googleproto.Equal(v[nsID], &proto.NamespaceUpdate{
+										Id:     types.NamespaceIDToProto(nsID),
 										Labels: map[string]string{"key.1": "value.1", "key_2": "value-2"},
-									},
-								}))
+									})
+									return equal
+								}).Should(BeTrue())
 							}
 						})
 					})
@@ -560,7 +568,7 @@ var _ = Context("_POL-SYNC_ _BPF-SAFE_ policy sync API tests", func() {
 				expectFullSync := func(client *mockWorkloadClient) {
 					// The new client should take over, getting a full sync.
 					Eventually(client.InSync).Should(BeTrue())
-					Eventually(client.ActiveProfiles).Should(Equal(set.From(proto.ProfileID{Name: "default"})))
+					Eventually(client.ActiveProfiles).Should(Equal(set.From(types.ProfileID{Name: "default"})))
 					Eventually(client.EndpointToPolicyOrder).Should(Equal(map[string][]mock.TierInfo{"k8s/fv/fv-pod-0/eth0": {}}))
 				}
 

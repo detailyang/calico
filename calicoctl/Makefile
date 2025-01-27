@@ -43,13 +43,8 @@ clean:
 	# Clean .created files which indicate images / releases have been built.
 	find . -name '.*.created*' -type f -delete
 	find . -name '.*.published*' -type f -delete
-	rm -rf .go-pkg-cache bin build certs *.tar calicoctl/commands/report $(CALICO_VERSION_HELPER_DIR)/bin
-	docker rmi $(CALICOCTL_IMAGE):latest-$(ARCH) || true
-	docker rmi $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) || true
-ifeq ($(ARCH),amd64)
-	docker rmi $(CALICOCTL_IMAGE):latest || true
-	docker rmi $(CALICOCTL_IMAGE):$(VERSION) || true
-endif
+	rm -rf bin build certs *.tar calicoctl/commands/report $(CALICO_VERSION_HELPER_DIR)/bin
+	-docker image rm -f $$(docker images $(CALICOCTL_IMAGE) -a -q)
 
 ###############################################################################
 # Building the binary
@@ -62,7 +57,6 @@ build-all: $(addprefix bin/calicoctl-linux-,$(VALIDARCHES)) bin/calicoctl-window
 build: bin/calicoctl-$(BUILDOS)-$(ARCH)
 # The supported different binary names. For each, ensure that an OS and ARCH is set
 bin/calicoctl-%-amd64: ARCH=amd64
-bin/calicoctl-%-armv7: ARCH=armv7
 bin/calicoctl-%-arm64: ARCH=arm64
 bin/calicoctl-%-ppc64le: ARCH=ppc64le
 bin/calicoctl-%-s390x: ARCH=s390x
@@ -76,11 +70,7 @@ bin/calicoctl-linux-%: BUILDOS=linux
 bin/calicoctl-%: $(SRC_FILES)
 	$(MAKE) build-calicoctl BUILDOS=$(BUILDOS) ARCH=$(ARCH)
 build-calicoctl:
-ifeq ($(BUILDOS)/$(ARCH), linux/amd64)
-	$(call build_static_cgo_boring_binary, ./calicoctl/calicoctl.go, bin/calicoctl-$(BUILDOS)-$(ARCH))
-else
 	$(call build_binary, ./calicoctl/calicoctl.go, bin/calicoctl-$(BUILDOS)-$(ARCH))
-endif
 
 # Overrides for the binaries that need different output names
 bin/calicoctl: bin/calicoctl-linux-amd64
@@ -88,20 +78,14 @@ bin/calicoctl: bin/calicoctl-linux-amd64
 bin/calicoctl-windows-amd64.exe: bin/calicoctl-windows-amd64
 	mv $< $@
 
-gen-crds:
-	$(DOCKER_RUN) \
-	  $(CALICO_BUILD) \
-	  sh -c 'cd /go/src/$(PACKAGE_NAME)/calicoctl/commands/crds && go generate'
-	$(MAKE) go-fmt
-
 ###############################################################################
 # Building the image
 ###############################################################################
 .PHONY: image $(CALICOCTL_IMAGE)
 image: $(CALICOCTL_IMAGE)
 $(CALICOCTL_IMAGE): $(CTL_CONTAINER_CREATED)
-$(CTL_CONTAINER_CREATED): Dockerfile.$(ARCH) bin/calicoctl-linux-$(ARCH) register
-	$(DOCKER_BUILD) -t $(CALICOCTL_IMAGE):latest-$(ARCH) -f Dockerfile.$(ARCH) . --load
+$(CTL_CONTAINER_CREATED): Dockerfile bin/calicoctl-linux-$(ARCH)
+	$(DOCKER_BUILD) -t $(CALICOCTL_IMAGE):latest-$(ARCH) -f Dockerfile .
 	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
 	touch $@
 
@@ -118,22 +102,22 @@ CALICO_VERSION_HELPER_SRC=$(CALICO_VERSION_HELPER_DIR)/calico_version_helper.go
 .PHONY: version-helper
 version-helper: $(CALICO_VERSION_HELPER_BIN)
 $(CALICO_VERSION_HELPER_BIN): $(CALICO_VERSION_HELPER_SRC)
-	$(call build_static_cgo_boring_binary, $(CALICO_VERSION_HELPER_SRC), $(CALICO_VERSION_HELPER_BIN))
+	$(call build_binary, $(CALICO_VERSION_HELPER_SRC), $(CALICO_VERSION_HELPER_BIN))
 
 ###############################################################################
 # UTs
 ###############################################################################
 .PHONY: ut
 ## Run the tests in a container. Useful for CI, Mac dev.
-ut: bin/calicoctl-linux-amd64
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -cover -r calicoctl/*'
+ut: bin/calicoctl-linux-$(ARCH)
+	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'cd /go/src/$(PACKAGE_NAME) && ginkgo -cover -r $(GINKGO_ARGS) calicoctl/*'
 
 ###############################################################################
 # FVs
 ###############################################################################
 .PHONY: fv
 ## Run the tests in a container. Useful for CI, Mac dev.
-fv: bin/calicoctl-linux-amd64 version-helper
+fv: bin/calicoctl-linux-$(ARCH) version-helper
 	$(MAKE) run-etcd
 
 	# We start two API servers in order to test multiple kubeconfig support
@@ -161,7 +145,7 @@ ST_OPTIONS?=
 
 .PHONY: st
 ## Run the STs in a container
-st: bin/calicoctl-linux-amd64 version-helper
+st: bin/calicoctl-linux-$(ARCH) version-helper
 	$(MAKE) run-etcd
 	$(MAKE) run-kubernetes-master
 	# Use the host, PID and network namespaces from the host.
@@ -181,7 +165,7 @@ st: bin/calicoctl-linux-amd64 version-helper
 	$(MAKE) stop-kubernetes-master
 
 ## Run a local kubernetes master with API
-# TODO: Commonize this with the functions in lib.Makefile. 
+# TODO: Commonize this with the functions in lib.Makefile.
 # For now, these tests do something special and launch two apiserver on different ports, so it makes sense
 # to keep them separate.
 run-kubernetes-master: stop-kubernetes-master
@@ -243,7 +227,7 @@ run-kubernetes-master: stop-kubernetes-master
 	-docker exec -ti st-apiserver-${KUBE_APISERVER_PORT} kubectl \
 		--server=https://127.0.0.1:${KUBE_APISERVER_PORT} \
 		create namespace test
-	
+
 ## Stop the local kubernetes master
 stop-kubernetes-master:
 	# Delete the cluster role binding.
@@ -269,22 +253,12 @@ cd: image-all cd-common
 # Release
 ###############################################################################
 ## Produces a clean build of release artifacts at the specified version.
-release-build: .release-$(VERSION).created 
+release-build: .release-$(VERSION).created
 .release-$(VERSION).created:
 	$(MAKE) clean build-all image-all RELEASE=true
 	$(MAKE) retag-build-images-with-registries IMAGETAG=$(VERSION) RELEASE=true
 	$(MAKE) retag-build-images-with-registries IMAGETAG=latest RELEASE=true
 	touch $@
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	if ! docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version | grep 'Version:\s*$(VERSION)$$'; then \
-	  echo "Reported version:" `docker run $(CALICOCTL_IMAGE):$(VERSION)-$(ARCH) version` "\nExpected version: $(VERSION)"; \
-	  false; \
-	else \
-	  echo "Version check passed\n"; \
-	fi
 
 ## Pushes a github release and release artifacts produced by `make release-build`.
 release-publish: release-prereqs .release-$(VERSION).published

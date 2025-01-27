@@ -23,7 +23,8 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/status"
 
 	"github.com/projectcalico/calico/app-policy/policystore"
-	"github.com/projectcalico/calico/app-policy/proto"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 )
 
 func TestCheckNoStore(t *testing.T) {
@@ -53,7 +54,7 @@ func TestCheckStore(t *testing.T) {
 		s.Endpoint = &proto.WorkloadEndpoint{
 			ProfileIds: []string{"default"},
 		}
-		s.ProfileByID[proto.ProfileID{Name: "default"}] = &proto.Profile{
+		s.ProfileByID[types.ProfileID{Name: "default"}] = &proto.Profile{
 			InboundRules: []*proto.Rule{{Action: "Allow"}},
 		}
 	})

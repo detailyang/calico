@@ -15,13 +15,13 @@
 package syncserver_test
 
 import (
-	. "github.com/projectcalico/calico/typha/pkg/syncserver"
-
 	"math"
 	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	. "github.com/projectcalico/calico/typha/pkg/syncserver"
 )
 
 // These low-level tests complement the FV tests (in typha/fv-tests), which spin up the server on a real port.
@@ -41,6 +41,7 @@ var _ = Describe("With zero config", func() {
 			MinBatchingAgeThreshold:        100 * time.Millisecond,
 			PingInterval:                   10 * time.Second,
 			PongTimeout:                    60 * time.Second,
+			HandshakeTimeout:               10 * time.Second,
 			DropInterval:                   time.Second,
 			ShutdownTimeout:                300 * time.Second,
 			ShutdownMaxDropInterval:        time.Second,

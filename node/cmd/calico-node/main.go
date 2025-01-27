@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package main
 
 import (
@@ -19,16 +20,12 @@ import (
 	"os"
 	"time"
 
-	confdConfig "github.com/projectcalico/calico/confd/pkg/config"
-	confd "github.com/projectcalico/calico/confd/pkg/run"
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-	"github.com/projectcalico/calico/node/pkg/nodeinit"
-
 	"github.com/sirupsen/logrus"
 
+	confdConfig "github.com/projectcalico/calico/confd/pkg/config"
+	confd "github.com/projectcalico/calico/confd/pkg/run"
 	felix "github.com/projectcalico/calico/felix/daemon"
 	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
-
 	"github.com/projectcalico/calico/node/buildinfo"
 	"github.com/projectcalico/calico/node/cmd/calico-node/bpf"
 	"github.com/projectcalico/calico/node/pkg/allocateip"
@@ -37,8 +34,8 @@ import (
 	"github.com/projectcalico/calico/node/pkg/hostpathinit"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/shutdown"
 	"github.com/projectcalico/calico/node/pkg/lifecycle/startup"
+	"github.com/projectcalico/calico/node/pkg/nodeinit"
 	"github.com/projectcalico/calico/node/pkg/status"
-	"github.com/projectcalico/calico/node/pkg/winupgrade"
 )
 
 // Create a new flag set.
@@ -49,10 +46,8 @@ var version = flagSet.Bool("v", false, "Display version")
 var runFelix = flagSet.Bool("felix", false, "Run Felix")
 var runBPF = flagSet.Bool("bpf", false, "Run BPF debug tool")
 var runInit = flagSet.Bool("init", false, "Do privileged initialisation of a new node (mount file systems etc).")
-var bestEffort = flagSet.Bool("best-effort", false, "Used in combination with the init flag. Report errors but do not fail if an error occures during initialisation.")
+var bestEffort = flagSet.Bool("best-effort", false, "Used in combination with the init flag. Report errors but do not fail if an error occurs during initialisation.")
 var runStartup = flagSet.Bool("startup", false, "Do non-privileged start-up routine.")
-var runWinUpgrade = flagSet.Bool("upgrade-windows", false, "Run Windows upgrade service.")
-var runShouldInstallWindowsUpgrade = flagSet.Bool("should-install-windows-upgrade", false, "Check if Windows upgrade service should be installed.")
 var runShutdown = flagSet.Bool("shutdown", false, "Do shutdown routine.")
 var monitorAddrs = flagSet.Bool("monitor-addresses", false, "Monitor change in node IP addresses")
 var runAllocateTunnelAddrs = flagSet.Bool("allocate-tunnel-addrs", false, "Configure tunnel addresses for this node")
@@ -86,15 +81,12 @@ var confdConfDir = flagSet.String("confd-confdir", "/etc/calico/confd", "Confd c
 var initHostpaths = flagSet.Bool("hostpath-init", false, "Initialize hostpaths for non-root access")
 
 func main() {
-	// Make sure the RNG is seeded, we use it for backoffs and the like.
-	seedrng.EnsureSeeded()
-
 	// Log to stdout.  this prevents our logs from being interpreted as errors by, for example,
 	// fluentd's default configuration.
 	logrus.SetOutput(os.Stdout)
 
-	// Install a hook that adds file/line no information.
-	logrus.AddHook(&logutils.ContextHook{})
+	// Set up logging formatting.
+	logutils.ConfigureFormatter("node")
 
 	// Parse the provided flags.
 	err := flagSet.Parse(os.Args[1:])
@@ -147,12 +139,6 @@ func main() {
 	} else if *runShutdown {
 		logrus.SetFormatter(&logutils.Formatter{Component: "shutdown"})
 		shutdown.Run()
-	} else if *runWinUpgrade {
-		logrus.SetFormatter(&logutils.Formatter{Component: "windows-upgrade"})
-		winupgrade.Run()
-	} else if *runShouldInstallWindowsUpgrade {
-		logrus.SetFormatter(&logutils.Formatter{Component: "should-install-windows-upgrade"})
-		winupgrade.ShouldInstallUpgradeService()
 	} else if *monitorAddrs {
 		logrus.SetFormatter(&logutils.Formatter{Component: "monitor-addresses"})
 		startup.ConfigureLogging()

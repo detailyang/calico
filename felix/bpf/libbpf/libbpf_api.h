@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "globals.h"
+#include "ip_addr.h"
 
 static void set_errno(int ret) {
 	errno = ret >= 0 ? ret : -ret;
@@ -49,12 +50,12 @@ int bpf_program_fd(struct bpf_object *obj, char *secname)
 	return fd;
 }
 
-struct bpf_tc_opts bpf_tc_program_attach(struct bpf_object *obj, char *secName, int ifIndex, bool ingress)
+struct bpf_tc_opts bpf_tc_program_attach(struct bpf_object *obj, char *secName, int ifIndex, bool ingress, int prio)
 {
 	DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook,
 			.attach_point = ingress ? BPF_TC_INGRESS : BPF_TC_EGRESS,
 			);
-	DECLARE_LIBBPF_OPTS(bpf_tc_opts, attach);
+	DECLARE_LIBBPF_OPTS(bpf_tc_opts, attach, .priority=prio,);
 
 	attach.prog_fd = bpf_program__fd(bpf_object__find_program_by_name(obj, secName));
 	if (attach.prog_fd < 0) {
@@ -138,45 +139,96 @@ int bpf_link_destroy(struct bpf_link *link) {
 
 void bpf_tc_set_globals(struct bpf_map *map,
 			char *iface_name,
-			uint host_ip,
-			uint intf_ip,
+			char* host_ip,
+			char* intf_ip,
+			char* host_ip6,
+			char* intf_ip6,
 			uint ext_to_svc_mark,
 			ushort tmtu,
 			ushort vxlanPort,
 			ushort psnat_start,
 			ushort psnat_len,
-			uint host_tunnel_ip,
+			char* host_tunnel_ip,
+			char* host_tunnel_ip6,
 			uint flags,
 			ushort wg_port,
+			ushort wg6_port,
+			ushort profiling,
 			uint natin,
 			uint natout,
 			uint log_filter_jmp,
-			uint *jumps)
+			uint *jumps,
+			uint *jumps6)
 {
-	struct cali_tc_globals data = {
-		.host_ip = host_ip,
+	struct cali_tc_global_data v4 = {
 		.tunnel_mtu = tmtu,
 		.vxlan_port = vxlanPort,
-		.intf_ip = intf_ip,
 		.ext_to_svc_mark = ext_to_svc_mark,
 		.psnat_start = psnat_start,
 		.psnat_len = psnat_len,
-		.host_tunnel_ip = host_tunnel_ip,
 		.flags = flags,
 		.wg_port = wg_port,
+		.profiling = profiling,
 		.natin_idx = natin,
 		.natout_idx = natout,
 		.log_filter_jmp = log_filter_jmp,
 	};
 
-	strncpy(data.iface_name, iface_name, sizeof(data.iface_name));
-	data.iface_name[sizeof(data.iface_name)-1] = '\0';
+	strncpy(v4.iface_name, iface_name, sizeof(v4.iface_name));
+	v4.iface_name[sizeof(v4.iface_name)-1] = '\0';
+
+	struct cali_tc_global_data v6 = v4;
+	struct cali_tc_preamble_globals data;
+
+	memcpy(&v4.host_ip, host_ip, 16);
+	memcpy(&v4.intf_ip, intf_ip, 16);
+	memcpy(&v4.host_tunnel_ip, host_tunnel_ip, 16);
+
+	memcpy(&v6.host_ip, host_ip6, 16);
+	memcpy(&v6.intf_ip, intf_ip6, 16);
+	memcpy(&v6.host_tunnel_ip, host_tunnel_ip6, 16);
 
 	int i;
 
-	for (i = 0; i < sizeof(data.jumps)/sizeof(uint); i++) {
-		data.jumps[i] = jumps[i];
+	for (i = 0; i < sizeof(v4.jumps)/sizeof(uint); i++) {
+		v4.jumps[i] = jumps[i];
 	}
+
+	for (i = 0; i < sizeof(v6.jumps)/sizeof(uint); i++) {
+		v6.jumps[i] = jumps6[i];
+	}
+
+	v6.wg_port = wg6_port;
+
+	data.v4 = v4;
+	data.v6 = v6;
+	set_errno(bpf_map__set_initial_value(map, (void*)(&data), sizeof(data)));
+}
+
+
+void bpf_ct_cleanup_set_globals(
+    struct bpf_map *map,
+    uint64_t creation_grace,
+
+    uint64_t tcp_syn_sent,
+    uint64_t tcp_established,
+    uint64_t tcp_fins_seen,
+    uint64_t tcp_reset_seen,
+
+    uint64_t udp_timeout,
+    uint64_t generic_timeout,
+    uint64_t icmp_timeout
+) {
+	struct cali_ct_cleanup_globals data = {
+		.creation_grace = creation_grace,
+		.tcp_syn_sent = tcp_syn_sent,
+		.tcp_established = tcp_established,
+		.tcp_fins_seen = tcp_fins_seen,
+		.tcp_reset_seen = tcp_reset_seen,
+		.udp_timeout = udp_timeout,
+		.generic_timeout = generic_timeout,
+		.icmp_timeout = icmp_timeout,
+	};
 
 	set_errno(bpf_map__set_initial_value(map, (void*)(&data), sizeof(data)));
 }
@@ -185,7 +237,7 @@ int bpf_xdp_program_id(int ifIndex) {
 	__u32 prog_id = 0, flags = 0;
 	int err;
 
-	err = bpf_get_link_xdp_id(ifIndex, &prog_id, flags);
+	err = bpf_xdp_query_id(ifIndex, flags, &prog_id);
 	set_errno(err);
 	return prog_id;
 }
@@ -195,8 +247,8 @@ int bpf_program_attach_xdp(struct bpf_object *obj, char *name, int ifIndex, int 
 	int err = 0;
 	struct bpf_link *link = NULL;
 	struct bpf_program *prog, *first_prog = NULL;
-	DECLARE_LIBBPF_OPTS(bpf_xdp_set_link_opts, opts,
-		.old_fd = bpf_prog_get_fd_by_id(old_id));
+	DECLARE_LIBBPF_OPTS(bpf_xdp_attach_opts, opts,
+		.old_prog_fd = bpf_prog_get_fd_by_id(old_id));
 
 	if (!(prog = bpf_object__find_program_by_name(obj, name))) {
 		err = ENOENT;
@@ -209,7 +261,7 @@ int bpf_program_attach_xdp(struct bpf_object *obj, char *name, int ifIndex, int 
 		return prog_fd;
 	}
 
-	err = bpf_set_link_xdp_fd_opts(ifIndex, prog_fd, flags, &opts);
+	err = bpf_xdp_attach(ifIndex, prog_fd, flags, &opts);
 	set_errno(err);
 	return err;
 
@@ -276,25 +328,30 @@ void bpf_ctlb_set_globals(struct bpf_map *map, uint udp_not_seen_timeo, bool exc
 	set_errno(bpf_map__set_initial_value(map, (void*)(&data), sizeof(data)));
 }
 
-void bpf_xdp_set_globals(struct bpf_map *map, char *iface_name, uint *jumps)
+void bpf_xdp_set_globals(struct bpf_map *map, char *iface_name, uint *jumps, uint *jumpsV6)
 {
-	struct cali_xdp_globals data = {
+	struct cali_xdp_preamble_globals data = {
 	};
 
-	strncpy(data.iface_name, iface_name, sizeof(data.iface_name));
-	data.iface_name[sizeof(data.iface_name)-1] = '\0';
-	
+	strncpy(data.v4.iface_name, iface_name, sizeof(data.v4.iface_name));
+	data.v4.iface_name[sizeof(data.v4.iface_name)-1] = '\0';
+	data.v6 = data.v4;
+
 	int i;
 
-	for (i = 0; i < sizeof(data.jumps)/sizeof(__u32); i++) {
-		data.jumps[i] = jumps[i];
+	for (i = 0; i < sizeof(data.v4.jumps)/sizeof(__u32); i++) {
+		data.v4.jumps[i] = jumps[i];
+	}
+
+	for (i = 0; i < sizeof(data.v6.jumps)/sizeof(__u32); i++) {
+		data.v6.jumps[i] = jumpsV6[i];
 	}
 
 	set_errno(bpf_map__set_initial_value(map, (void*)(&data), sizeof(data)));
 }
 
 void bpf_map_set_max_entries(struct bpf_map *map, uint max_entries) {
-	set_errno(bpf_map__resize(map, max_entries));
+	set_errno(bpf_map__set_max_entries(map, max_entries));
 }
 
 int num_possible_cpu()

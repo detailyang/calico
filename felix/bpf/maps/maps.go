@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,10 +26,9 @@ import (
 	"sync"
 	"syscall"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
 	"github.com/projectcalico/calico/felix/bpf/libbpf"
@@ -132,6 +131,9 @@ type Map interface {
 	Update(k, v []byte) error
 	Get(k []byte) ([]byte, error)
 	Delete(k []byte) error
+
+	// Size returns the maximun number of entries the table can hold.
+	Size() int
 }
 
 type MapWithExistsCheck interface {
@@ -222,7 +224,7 @@ func ResetSizes() {
 
 func NewPinnedMap(params MapParameters) *PinnedMap {
 	if len(params.VersionedName()) >= unix.BPF_OBJ_NAME_LEN {
-		log.WithField("name", params.Name).Panic("Bug: BPF map name too long")
+		log.WithField("name", params.Name).Panicf("Bug: BPF map name too long (%d)", len(params.VersionedName()))
 	}
 	if val := Size(params.VersionedName()); val != 0 {
 		params.MaxEntries = val
@@ -288,7 +290,7 @@ func ShowMapCmd(m Map) ([]string, error) {
 		}, nil
 	}
 
-	return nil, errors.Errorf("unrecognized map type %T", m)
+	return nil, fmt.Errorf("unrecognized map type %T", m)
 }
 
 // DumpMapCmd returns the command that can be used to dump a map or an error
@@ -305,7 +307,7 @@ func DumpMapCmd(m Map) ([]string, error) {
 		}, nil
 	}
 
-	return nil, errors.Errorf("unrecognized map type %T", m)
+	return nil, fmt.Errorf("unrecognized map type %T", m)
 }
 
 func MapDeleteKeyCmd(m Map, key []byte) ([]string, error) {
@@ -330,13 +332,20 @@ func MapDeleteKeyCmd(m Map, key []byte) ([]string, error) {
 		return cmd, nil
 	}
 
-	return nil, errors.Errorf("unrecognized map type %T", m)
+	return nil, fmt.Errorf("unrecognized map type %T", m)
 }
+
+var ErrNotSupported = fmt.Errorf("prog_array iteration not supported")
 
 // Iter iterates over the map, passing each key/value pair to the provided callback function.  Warning:
 // The key and value are owned by the iterator and will be clobbered by the next iteration so they must not be
 // retained or modified.
 func (b *PinnedMap) Iter(f IterCallback) error {
+	if b.Type == "prog_array" {
+		// We currently have a bug in iteration of program array maps;
+		// the C code tight loops due to the empty slots.
+		return ErrNotSupported
+	}
 	valueSize := b.ValueSize
 	if b.perCPU {
 		valueSize = b.ValueSize * NumPossibleCPUs()
@@ -360,7 +369,7 @@ func (b *PinnedMap) Iter(f IterCallback) error {
 		if action == IterDelete {
 			// The previous iteration asked us to delete its key; do that now before we check for the end of
 			// the iteration.
-			err := DeleteMapEntry(b.MapFD(), keyToDelete, valueSize)
+			err := DeleteMapEntry(b.MapFD(), keyToDelete)
 			if err != nil && !IsNotExists(err) {
 				return fmt.Errorf("failed to delete map entry: %w", err)
 			}
@@ -370,7 +379,7 @@ func (b *PinnedMap) Iter(f IterCallback) error {
 			if err == ErrIterationFinished {
 				return nil
 			}
-			return errors.Errorf("iterating the map failed: %s", err)
+			return fmt.Errorf("iterating the map failed: %s", err)
 		}
 
 		action = f(k, v)
@@ -416,21 +425,11 @@ func (b *PinnedMap) Get(k []byte) ([]byte, error) {
 }
 
 func (b *PinnedMap) Delete(k []byte) error {
-	valueSize := b.ValueSize
-	if b.perCPU {
-		valueSize = b.ValueSize * NumPossibleCPUs()
-		log.Debugf("Set value size to %v for deleting an entry from Per-CPU map", valueSize)
-	}
-	return DeleteMapEntry(b.fd, k, valueSize)
+	return DeleteMapEntry(b.fd, k)
 }
 
 func (b *PinnedMap) DeleteIfExists(k []byte) error {
-	valueSize := b.ValueSize
-	if b.perCPU {
-		valueSize = b.ValueSize * NumPossibleCPUs()
-		log.Debugf("Set value size to %v for deleting an entry from Per-CPU map", valueSize)
-	}
-	return DeleteMapEntryIfExists(b.fd, k, valueSize)
+	return DeleteMapEntryIfExists(b.fd, k)
 }
 
 func (b *PinnedMap) updateDeltaEntries() error {
@@ -462,7 +461,7 @@ func (b *PinnedMap) updateDeltaEntries() error {
 			if err == ErrIterationFinished {
 				break
 			}
-			return errors.Errorf("iterating the old map failed: %s", err)
+			return fmt.Errorf("iterating the old map failed: %s", err)
 		}
 		if numEntriesCopied == b.MaxEntries {
 			return fmt.Errorf("new map cannot hold all the data from the old map %s.", b.GetName())
@@ -511,7 +510,7 @@ func (b *PinnedMap) copyFromOldMap() error {
 			if err == ErrIterationFinished {
 				return nil
 			}
-			return errors.Errorf("iterating the old map failed: %s", err)
+			return fmt.Errorf("iterating the old map failed: %s", err)
 		}
 
 		if numEntriesCopied == b.MaxEntries {
@@ -579,6 +578,7 @@ func (b *PinnedMap) Open() error {
 }
 
 func (b *PinnedMap) repinAt(fd int, from, to string) error {
+	log.Infof("Repinning BPF map from %s to %s", from, to)
 	err := libbpf.ObjPin(fd, to)
 	if err != nil {
 		return fmt.Errorf("error repinning %s to %s: %w", from, to, err)
@@ -607,19 +607,27 @@ func (b *PinnedMap) EnsureExists() error {
 		return nil
 	}
 
-	// In case felix restarts in the middle of migration, we might end up with
-	// old map. Repin the old map and let the map creation continue.
+	// In case felix restarts in the middle of migration, the in-use map
+	// will be pinned with suffix "_old" and the map in the normal place
+	// wil be a partially-migrated map.  Clean up the partial map and move
+	// the old map back into its normal place.
 	if b.oldMapExists() {
-		log.WithField("name", b.Name).Debug("Old map exists")
+		log.WithField("name", b.Name).Info("Old map exists (from previous migration attempt?)")
 		if _, err := os.Stat(b.Path()); err == nil {
-			os.Remove(b.Path())
+			err := os.Remove(b.Path())
+			if err != nil {
+				log.WithError(err).Warning("Failed to remove partially-migrated map.  Ignoring...")
+			}
 		}
 		fd, err := libbpf.ObjGet(oldMapPath)
 		if err != nil {
 			return fmt.Errorf("cannot get old map at %s: %w", oldMapPath, err)
 		}
 		err = b.repinAt(fd, oldMapPath, b.Path())
-		syscall.Close(fd)
+		closeErr := syscall.Close(fd)
+		if closeErr != nil {
+			log.WithError(err).Warn("Error from fd.Close().  Ignoring.")
+		}
 		if err != nil {
 			return fmt.Errorf("error repinning old map %s to %s, err=%w", oldMapPath, b.Path(), err)
 		}
@@ -632,30 +640,50 @@ func (b *PinnedMap) EnsureExists() error {
 			return fmt.Errorf("error getting map info of the pinned map %w", err)
 		}
 
-		if b.MaxEntries == mapInfo.MaxEntries {
-			return nil
-		}
-		log.WithField("name", b.Name).Debugf("Size changed %d -> %d", mapInfo.MaxEntries, b.MaxEntries)
+		if b.KeySize != mapInfo.KeySize || b.ValueSize != mapInfo.ValueSize {
+			b.MapFD().Close()
+			os.Remove(b.Path())
+			log.WithFields(log.Fields{
+				"name":          b.Name,
+				"Old KeySize":   mapInfo.KeySize,
+				"New KeySize":   b.KeySize,
+				"Old ValueSize": mapInfo.ValueSize,
+				"New ValueSize": b.ValueSize,
+			}).Warn("Map with same name but different parameters exists. Deleting it")
+		} else {
+			if b.MaxEntries == mapInfo.MaxEntries {
+				log.WithField("name", b.Name).Info("Map already exists with correct parameters.")
+				return nil
+			}
+			log.WithField("name", b.Name).Infof("BPF map size changed; need to migrate %d -> %d", mapInfo.MaxEntries, b.MaxEntries)
 
-		// store the old fd
-		b.oldfd = b.MapFD()
-		b.oldSize = mapInfo.MaxEntries
+			// store the old fd
+			b.oldfd = b.MapFD()
+			b.oldSize = mapInfo.MaxEntries
 
-		err = b.repinAt(int(b.MapFD()), b.Path(), oldMapPath)
-		if err != nil {
-			return fmt.Errorf("error migrating the old map %w", err)
-		}
-		copyData = true
-		// Do not close the oldfd if the map is updated by the BPF programs.
-		if !b.UpdatedByBPF {
-			defer func() {
-				b.oldfd.Close()
-				b.oldfd = 0
-			}()
+			err = b.repinAt(int(b.MapFD()), b.Path(), oldMapPath)
+			if err != nil {
+				return fmt.Errorf("error repinning the old map %w", err)
+			}
+			copyData = true
+			// Do not close the oldfd if the map is updated by the BPF programs.
+			if !b.UpdatedByBPF {
+				defer func() {
+					err := b.oldfd.Close()
+					if err != nil {
+						log.WithError(err).Warn("Error closing old map fd. Ignoring.")
+					}
+					b.oldfd = 0
+				}()
+			}
 		}
 	}
 
-	log.WithField("name", b.Name).Debug("Map didn't exist, creating it")
+	log.WithFields(log.Fields{
+		"name":      b.Name,
+		"keySize":   b.KeySize,
+		"valuesize": b.ValueSize,
+	}).Debug("Map didn't exist, creating it")
 	cmd := exec.Command("bpftool", "map", "create", b.VersionedFilename(),
 		"type", b.Type,
 		"key", fmt.Sprint(b.KeySize),
@@ -677,10 +705,13 @@ func (b *PinnedMap) EnsureExists() error {
 			// same version but of different size.
 			err := b.copyFromOldMap()
 			if err != nil {
-				b.fd.Close()
+				log.WithError(err).Error("error copying data from old map")
+				closeErr := b.fd.Close()
+				if closeErr != nil {
+					log.WithError(closeErr).Warn("Error when closing FD, ignoring...")
+				}
 				b.fd = 0
 				b.fdLoaded = false
-				log.WithError(err).Error("error copying data from old map")
 				return err
 			}
 			// Delete the old pin if the map is not updated by BPF programs.
@@ -694,7 +725,10 @@ func (b *PinnedMap) EnsureExists() error {
 		// Handle map upgrade.
 		err = b.upgrade()
 		if err != nil {
-			b.fd.Close()
+			closeErr := b.fd.Close()
+			if closeErr != nil {
+				log.WithError(closeErr).Warn("Error when closing FD, ignoring...")
+			}
 			b.fd = 0
 			b.fdLoaded = false
 			return err
@@ -703,6 +737,10 @@ func (b *PinnedMap) EnsureExists() error {
 			Info("Loaded map file descriptor.")
 	}
 	return err
+}
+
+func (b *PinnedMap) Size() int {
+	return b.MapParameters.MaxEntries
 }
 
 type bpftoolMapMeta struct {
@@ -856,19 +894,23 @@ type Upgradable interface {
 }
 
 type TypedMap[K Key, V Value] struct {
-	MapWithExistsCheck
+	untypedMap   MapWithExistsCheck
 	kConstructor func([]byte) K
 	vConstructor func([]byte) V
 }
 
+func (m *TypedMap[K, V]) ErrIsNotExists(err error) bool {
+	return m.untypedMap.ErrIsNotExists(err)
+}
+
 func (m *TypedMap[K, V]) Update(k K, v V) error {
-	return m.MapWithExistsCheck.Update(k.AsBytes(), v.AsBytes())
+	return m.untypedMap.Update(k.AsBytes(), v.AsBytes())
 }
 
 func (m *TypedMap[K, V]) Get(k K) (V, error) {
 	var res V
 
-	vb, err := m.MapWithExistsCheck.Get(k.AsBytes())
+	vb, err := m.untypedMap.Get(k.AsBytes())
 	if err != nil {
 		goto exit
 	}
@@ -880,14 +922,14 @@ exit:
 }
 
 func (m *TypedMap[K, V]) Delete(k K) error {
-	return m.MapWithExistsCheck.Delete(k.AsBytes())
+	return m.untypedMap.Delete(k.AsBytes())
 }
 
 func (m *TypedMap[K, V]) Load() (map[K]V, error) {
 
 	memMap := make(map[K]V)
 
-	err := m.MapWithExistsCheck.Iter(func(kb, vb []byte) IteratorAction {
+	err := m.untypedMap.Iter(func(kb, vb []byte) IteratorAction {
 		memMap[m.kConstructor(kb)] = m.vConstructor(vb)
 		return IterNone
 	})
@@ -897,8 +939,8 @@ func (m *TypedMap[K, V]) Load() (map[K]V, error) {
 
 func NewTypedMap[K Key, V Value](m MapWithExistsCheck, kConstructor func([]byte) K, vConstructor func([]byte) V) *TypedMap[K, V] {
 	return &TypedMap[K, V]{
-		MapWithExistsCheck: m,
-		kConstructor:       kConstructor,
-		vConstructor:       vConstructor,
+		untypedMap:   m,
+		kConstructor: kConstructor,
+		vConstructor: vConstructor,
 	}
 }

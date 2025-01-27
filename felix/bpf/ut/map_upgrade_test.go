@@ -17,7 +17,6 @@ package ut_test
 import (
 	"os"
 	"os/exec"
-
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -361,7 +360,7 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 		Expect(err).NotTo(HaveOccurred())
 	}
 
-	// Reping /sys/fs/bpt/tc/globals/cali_mock2_old1 to /sys/fs/bpt/tc/globals/cali_mock2_old
+	// Repin /sys/fs/bpt/tc/globals/cali_mock2_old1 to /sys/fs/bpt/tc/globals/cali_mock2_old
 	err = libbpf.ObjPin(int(mockMapv2_old.MapFD()), mockMapv2.Path()+"_old")
 	Expect(err).NotTo(HaveOccurred())
 	// Remove /sys/fs/bpt/tc/globals/cali_mock2_old1
@@ -393,4 +392,42 @@ func TestMapUpgradeWhileResizeInProgress(t *testing.T) {
 	deleteMap(mockMapv5)
 	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(mockMapv5.GetName()))
 	Eventually(bpfMapList, "10s", "200ms").ShouldNot(ContainSubstring(mockMapv2.GetName()))
+}
+
+func TestUpgradeWithSameVersionDifferentParams(t *testing.T) {
+	RegisterTestingT(t)
+
+	// Create v2 map and add 10 entries to it
+	mockMapv2 := mock.MapV2(10)
+	err := mockMapv2.EnsureExists()
+	Expect(err).NotTo(HaveOccurred())
+
+	mapInfo, err := maps.GetMapInfo(mockMapv2.MapFD())
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(mapInfo.KeySize).To(Equal(16))
+	Expect(mapInfo.ValueSize).To(Equal(64))
+
+	mapParams := mock.GetMapParams(2)
+	mapParams.KeySize = 24
+	b := maps.NewPinnedMap(mapParams)
+	err = b.EnsureExists()
+	Expect(err).NotTo(HaveOccurred())
+
+	mapInfo, err = maps.GetMapInfo(b.MapFD())
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(mapInfo.KeySize).To(Equal(24))
+	Expect(mapInfo.ValueSize).To(Equal(64))
+
+	mapParams.ValueSize = 128
+	b = maps.NewPinnedMap(mapParams)
+	err = b.EnsureExists()
+	Expect(err).NotTo(HaveOccurred())
+
+	mapInfo, err = maps.GetMapInfo(b.MapFD())
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(mapInfo.KeySize).To(Equal(24))
+	Expect(mapInfo.ValueSize).To(Equal(128))
 }

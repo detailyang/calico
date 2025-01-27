@@ -24,21 +24,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/windows"
-
 	"github.com/Microsoft/hcsshim"
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
-
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/testutils"
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
+	"github.com/projectcalico/calico/cni-plugin/pkg/dataplane/windows"
 	"github.com/projectcalico/calico/cni-plugin/pkg/k8s"
 	"github.com/projectcalico/calico/cni-plugin/pkg/types"
 	libapi "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -46,10 +46,6 @@ import (
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 )
 
 func ensureNamespace(clientset *kubernetes.Clientset, name string) {
@@ -102,8 +98,6 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(err).NotTo(HaveOccurred())
 			}
 		}
-		// Create a random seed
-		seedrng.EnsureSeeded()
 		hostname, _ = names.Hostname()
 		ctx = context.Background()
 		for i := 1; i <= 3; i++ {
@@ -241,7 +235,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			Expect(len(result.IPs)).Should(Equal(1))
 			ip := result.IPs[0].Address.IP.String()
 			log.Debugf("ip is %v ", ip)
-			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 			Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 			// datastore things:
@@ -336,7 +330,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				log.Debugf("containerID %v ", containerID)
 				log.Debugf("result %v ", result)
 				Expect(len(result.IPs)).Should(Equal(1))
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -417,7 +411,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				ids := names.WorkloadEndpointIdentifiers{
@@ -496,7 +490,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -600,7 +594,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -771,7 +765,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 				Expect(len(result.IPs)).Should(Equal(1))
 				ip := result.IPs[0].Address.IP.String()
 				log.Debugf("ip is %v ", ip)
-				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+				result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 				Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 				// datastore things:
@@ -983,7 +977,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 					Expect(len(result.IPs)).Should(Equal(1))
 					ip := result.IPs[0].Address.IP.String()
 					log.Debugf("ip is %v ", ip)
-					result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+					result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 					Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 					// datastore things:
@@ -1818,7 +1812,7 @@ var _ = Describe("Kubernetes CNI tests", func() {
 			Expect(len(result.IPs)).Should(Equal(1))
 			ip := result.IPs[0].Address.IP.String()
 			log.Debugf("ip is %v ", ip)
-			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is respresented as 4 bytes
+			result.IPs[0].Address.IP = result.IPs[0].Address.IP.To4() // Make sure the IP is represented as 4 bytes
 			Expect(result.IPs[0].Address.Mask.String()).Should(Equal("fffff000"))
 
 			// datastore things:

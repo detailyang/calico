@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,36 +28,14 @@ import (
 	"syscall"
 	"time"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend"
-	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/felixsyncer"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/updateprocessors"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
-	"github.com/projectcalico/calico/libcalico-go/lib/health"
-	lclogutils "github.com/projectcalico/calico/libcalico-go/lib/logutils"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-	"github.com/projectcalico/calico/pod2daemon/binder"
-	"github.com/projectcalico/calico/typha/pkg/discovery"
-	"github.com/projectcalico/calico/typha/pkg/syncclient"
 
 	"github.com/projectcalico/calico/felix/buildinfo"
 	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/felix/collector"
 	"github.com/projectcalico/calico/felix/config"
 	dp "github.com/projectcalico/calico/felix/dataplane"
 	"github.com/projectcalico/calico/felix/jitter"
@@ -66,15 +44,32 @@ import (
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/statusrep"
 	"github.com/projectcalico/calico/felix/usagerep"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
+	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend"
+	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/dedupebuffer"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/felixsyncer"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/updateprocessors"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/watchersyncer"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
+	"github.com/projectcalico/calico/libcalico-go/lib/dispatcher"
+	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/health"
+	lclogutils "github.com/projectcalico/calico/libcalico-go/lib/logutils"
+	"github.com/projectcalico/calico/libcalico-go/lib/metricsserver"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
+	"github.com/projectcalico/calico/pod2daemon/binder"
+	"github.com/projectcalico/calico/typha/pkg/discovery"
+	"github.com/projectcalico/calico/typha/pkg/syncclient"
 )
 
 const (
-	// Our default value for GOGC if it is not set.  This is the percentage that heap usage must
-	// grow by to trigger a garbage collection.  Go's default is 100, meaning that 50% of the
-	// heap can be lost to garbage.  We reduce it to this value to trade increased CPU usage for
-	// lower occupancy.
-	defaultGCPercent = 20
-
 	// String sent on the failure report channel to indicate we're shutting down for config
 	// change.
 	reasonConfigChanged      = "config changed"
@@ -116,22 +111,11 @@ const (
 // main config parameters by exiting and allowing itself to be restarted by the init
 // daemon.
 func Run(configFile string, gitVersion string, buildDate string, gitRevision string) {
-	// Go's RNG is not seeded by default.  Make sure that's done.
-	seedrng.EnsureSeeded()
-
 	// Special-case handling for environment variable-configured logging:
 	// Initialise early so we can trace out config parsing.
 	logutils.ConfigureEarlyLogging()
 
 	ctx := context.Background()
-
-	if os.Getenv("GOGC") == "" {
-		// Tune the GC to trade off a little extra CPU usage for significantly lower
-		// occupancy at high scale.  This is worthwhile because Felix runs per-host so
-		// any occupancy improvement is multiplied by the number of hosts.
-		log.Debugf("No GOGC value set, defaulting to %d%%.", defaultGCPercent)
-		debug.SetGCPercent(defaultGCPercent)
-	}
 
 	if len(buildinfo.GitVersion) == 0 && len(gitVersion) != 0 {
 		buildinfo.GitVersion = gitVersion
@@ -220,7 +204,7 @@ configRetry:
 		}
 
 		// Each time round this loop, check that we're serving health reports if we should
-		// be, or cancel any existing server if we should not be serving any more.
+		// be, or cancel any existing server if we should not be serving anymore.
 		healthAggregator.ServeHTTP(configParams.HealthEnabled, configParams.HealthHost, configParams.HealthPort)
 
 		// We should now have enough config to connect to the datastore
@@ -307,7 +291,7 @@ configRetry:
 		} else {
 			// Not using KDD, fall back on trying to get a Kubernetes client from the environment.
 			log.Info("Not using Kubernetes datastore driver, trying to get a Kubernetes client...")
-			k8sconf, err := rest.InClusterConfig()
+			k8sconf, err := winutils.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
 			if err != nil {
 				log.WithError(err).Info("Kubernetes in-cluster config not available. " +
 					"Assuming we're not in a Kubernetes deployment.")
@@ -362,32 +346,6 @@ configRetry:
 		break configRetry
 	}
 
-	if numClientsCreated > 2 {
-		// We don't have a way to close datastore connection so, if we reconnected after
-		// a failure to load config, restart felix to avoid leaking connections.
-		exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
-	}
-
-	if configParams.BPFEnabled {
-		// Check for BPF dataplane support before we do anything that relies on the flag being set one way or another.
-		if err := dp.SupportsBPF(); err != nil {
-			log.Error("BPF dataplane mode enabled but not supported by the kernel.  Disabling BPF mode.")
-			_, err := configParams.OverrideParam("BPFEnabled", "false")
-			if err != nil {
-				log.WithError(err).Panic("Bug: failed to override config parameter")
-			}
-		}
-	}
-
-	// Set any watchdog timeout overrides before we initialise components.
-	health.SetGlobalTimeoutOverrides(configParams.HealthTimeoutOverrides)
-
-	// We're now both live and ready.
-	healthAggregator.Report(healthName, &health.HealthReport{Live: true, Ready: true})
-
-	// Enable or disable the health HTTP server according to coalesced config.
-	healthAggregator.ServeHTTP(configParams.HealthEnabled, configParams.HealthHost, configParams.HealthPort)
-
 	// If we get here, we've loaded the configuration successfully.
 	// Update log levels before we do anything else.
 	logutils.ConfigureLogging(configParams)
@@ -395,6 +353,56 @@ configRetry:
 	// again.
 	buildInfoLogCxt.WithField("config", configParams).Info(
 		"Successfully loaded configuration.")
+
+	if numClientsCreated > 2 {
+		// We don't have a way to close datastore connection so, if we reconnected after
+		// a failure to load config, restart felix to avoid leaking connections.
+		exitWithCustomRC(configChangedRC, "Restarting to avoid leaking datastore connections")
+	}
+
+	doGoRuntimeSetup(configParams)
+
+	if configParams.BPFEnabled {
+		// Check for BPF dataplane support before we do anything that relies on the flag being set one way or another.
+		if err := dp.SupportsBPF(); err != nil {
+			log.WithError(err).Error("BPF dataplane mode enabled but not supported by the kernel.  Disabling BPF mode.")
+			_, err := configParams.OverrideParam("BPFEnabled", "false")
+			if err != nil {
+				log.WithError(err).Panic("Bug: failed to override config parameter")
+			}
+		}
+	}
+
+	if configParams.BPFEnabled && configParams.IPForwarding == "Disabled" && configParams.BPFEnforceRPF != "Disabled" {
+		// BPF mode requires IP forwarding to be enabled because the BPF RPF
+		// check fails if it is disabled.  Seems to be an incorrect check in
+		// the kernel.  FIB lookups can only be done for interfaces that have
+		// forwarding enabled.
+		log.Warning("In BPF mode, either IPForwarding must be enabled or BPFEnforceRPF must be disabled. Forcing IPForwarding to 'Enabled'.")
+		_, err := configParams.OverrideParam("IPForwarding", "Enabled")
+		if err != nil {
+			log.WithError(err).Panic("Bug: failed to override config parameter")
+		}
+	}
+
+	// Set any watchdog timeout overrides before we initialise components.
+	health.SetGlobalTimeoutOverrides(configParams.HealthTimeoutOverrides)
+
+	// Enable or disable the health HTTP server according to coalesced config.
+	healthAggregator.ServeHTTP(configParams.HealthEnabled, configParams.HealthHost, configParams.HealthPort)
+
+	var lookupsCache *calc.LookupsCache
+	var dpStatsCollector collector.Collector
+
+	// Initialzed the lookup cache here and pass it along to both the calc_graph
+	// as well as dataplane driver, which actually uses this for lookups.
+	lookupsCache = calc.NewLookupsCache()
+
+	// Start the stats collector which also depends on the lookups cache.
+	dpStatsCollector = collector.New(configParams, lookupsCache, healthAggregator)
+
+	// Configure Windows firewall rules if appropriate
+	winutils.MaybeConfigureWindowsFirewallRules(configParams.WindowsManageFirewallRules, configParams.PrometheusMetricsEnabled, configParams.PrometheusMetricsPort)
 
 	if configParams.DebugPanicAfter > 0 {
 		log.WithField("delay", configParams.DebugPanicAfter).Warn("DebugPanicAfter is set, will panic after delay!")
@@ -404,6 +412,10 @@ configRetry:
 	if configParams.DebugSimulateDataRace {
 		log.Warn("DebugSimulateDataRace is set, will start some racing goroutines!")
 		simulateDataRace()
+	}
+
+	if configParams.DebugPort != 0 {
+		debugserver.StartDebugPprofServer(configParams.DebugHost, configParams.DebugPort)
 	}
 
 	// Start up the dataplane driver.  This may be the internal go-based driver or an external
@@ -427,9 +439,17 @@ configRetry:
 	dpDriver, dpDriverCmd = dp.StartDataplaneDriver(
 		configParams.Copy(), // Copy to avoid concurrent access.
 		healthAggregator,
+		dpStatsCollector,
 		configChangedRestartCallback,
 		fatalErrorCallback,
-		k8sClientSet)
+		k8sClientSet,
+		lookupsCache,
+	)
+
+	// Defer reporting ready until we've started the dataplane driver.  This
+	// ensures that our overall readiness waits for the dataplane driver to
+	// report ready on its health report.
+	healthAggregator.Report(healthName, &health.HealthReport{Live: true, Ready: true})
 
 	// Initialise the glue logic that connects the calculation graph to/from the dataplane driver.
 	log.Info("Connect to the dataplane driver.")
@@ -462,11 +482,20 @@ configRetry:
 		policySyncProcessor = policysync.NewProcessor(toPolicySync)
 		policySyncServer = policysync.NewServer(
 			policySyncProcessor.JoinUpdates,
+			dpStatsCollector,
 			policySyncUIDAllocator.NextUID,
 		)
 		policySyncAPIBinder = binder.NewBinder(configParams.PolicySyncPathPrefix)
 		policySyncServer.RegisterGrpc(policySyncAPIBinder.Server())
 		calcGraphClientChannels = append(calcGraphClientChannels, toPolicySync)
+	}
+
+	if dpStatsCollector != nil {
+		// Everybody who wanted to tweak the dpStatsCollector had a go, we can start it now!
+		if err := dpStatsCollector.Start(); err != nil {
+			// XXX we should panic once all dataplanes expect the collector to run.
+			log.WithError(err).Panic("Stats collector did not start.")
+		}
 	}
 
 	// Now create the calculation graph, which receives updates from the
@@ -485,7 +514,7 @@ configRetry:
 	// which will feed the calculation graph with updates, bringing Felix into sync.
 	var syncer Startable
 	var typhaConnection *syncclient.SyncerClient
-	syncerToValidator := calc.NewSyncerCallbacksDecoupler()
+	syncerToValidator := dedupebuffer.New()
 
 	if typhaDiscoverer.TyphaEnabled() {
 		// Use a remote Syncer, via the Typha server.
@@ -571,7 +600,9 @@ configRetry:
 	asyncCalcGraph := calc.NewAsyncCalcGraph(
 		configParams.Copy(), // Copy to avoid concurrent access.
 		calcGraphClientChannels,
-		healthAggregator)
+		healthAggregator,
+		lookupsCache,
+	)
 
 	if configParams.UsageReportingEnabled {
 		// Usage reporting enabled, add stats collector to graph.  When it detects an update
@@ -629,7 +660,7 @@ configRetry:
 	// calculation graph.
 	validator := calc.NewValidationFilter(asyncCalcGraph, configParams)
 
-	go syncerToValidator.SendTo(validator)
+	go syncerToValidator.SendToSinkForever(validator)
 	asyncCalcGraph.Start()
 	log.Infof("Started the processing graph")
 	var stopSignalChans []chan<- *sync.WaitGroup
@@ -637,16 +668,30 @@ configRetry:
 		delay := configParams.EndpointReportingDelaySecs
 		log.WithField("delay", delay).Info(
 			"Endpoint status reporting enabled, starting status reporter")
-		dpConnector.statusReporter = statusrep.NewEndpointStatusReporter(
+
+		fromDataplaneC := dpConnector.NewFromDataplaneConsumer()
+		statusReporter := statusrep.NewEndpointStatusReporter(
 			configParams.FelixHostname,
 			configParams.OpenstackRegion,
-			dpConnector.StatusUpdatesFromDataplane,
-			dpConnector.InSync,
+			fromDataplaneC,
 			dpConnector.datastore,
 			delay,
 			delay*180,
 		)
-		dpConnector.statusReporter.Start()
+		statusReporter.Start()
+	}
+
+	if configParams.EndpointStatusPathPrefix != "" {
+		if runtime.GOOS == "windows" {
+			log.WithField("os", runtime.GOOS).Info("EndpointStatusPathPrefix is currently unsupported on Windows. Ignoring config...")
+		} else {
+			fromDataplaneC := dpConnector.NewFromDataplaneConsumer()
+			statusFileReporter := statusrep.NewEndpointStatusFileReporter(fromDataplaneC, configParams.EndpointStatusPathPrefix, statusrep.WithHostname(configParams.FelixHostname))
+
+			log.WithField("path", configParams.EndpointStatusPathPrefix).Info("Starting endpoint-status file-reporter")
+			ctx := context.Background()
+			go statusFileReporter.SyncForever(ctx)
+		}
 	}
 
 	// Start communicating with the dataplane driver.
@@ -674,7 +719,11 @@ configRetry:
 		})
 		gaugeHost.Set(1)
 		prometheus.MustRegister(gaugeHost)
-		go dp.ServePrometheusMetrics(configParams)
+		dp.ConfigurePrometheusMetrics(configParams)
+		go metricsserver.ServePrometheusMetricsForever(
+			configParams.PrometheusMetricsHost,
+			configParams.PrometheusMetricsPort,
+		)
 	}
 
 	// Register signal handlers to dump memory/CPU profiles.
@@ -683,6 +732,41 @@ configRetry:
 	// Now monitor the worker process and our worker threads and shut
 	// down the process gracefully if they fail.
 	monitorAndManageShutdown(failureReportChan, dpDriverCmd, stopSignalChans)
+}
+
+func doGoRuntimeSetup(params *config.Config) {
+	var effectiveGOGC int
+	if os.Getenv("GOGC") == "" {
+		log.WithField("GOGC", params.GoGCThreshold).Info("Setting GOGC from configuration.")
+		debug.SetGCPercent(params.GoGCThreshold)
+		effectiveGOGC = params.GoGCThreshold
+	} else {
+		// Doesn't seem to be a way to get the current value without also
+		// setting it...
+		effectiveGOGC = debug.SetGCPercent(-1)
+		debug.SetGCPercent(effectiveGOGC)
+		log.WithField("GOGC", effectiveGOGC).Info("GOGC already set, not changing.")
+	}
+	limitFromEnv := os.Getenv("GOMEMLIMIT")
+	if limitFromEnv != "" {
+		log.WithField("GOMEMLIMIT", limitFromEnv).Info("Memory limit already set with GOMEMLIMIT, not changing.")
+		return
+	}
+	if params.GoMemoryLimitMB > -1 {
+		log.WithField("GoMemoryLimitMB", params.GoMemoryLimitMB).Info("Setting memory limit from configuration.")
+		memLimit := int64(params.GoMemoryLimitMB) * 1024 * 1024
+		debug.SetMemoryLimit(memLimit)
+	} else if effectiveGOGC < 0 {
+		log.Warn("GC is disabled and no memory limit is set.  Expect to run out of memory!")
+	}
+	defaultGoMaxProcs := runtime.GOMAXPROCS(-1)
+	logCtx := log.WithField("default", defaultGoMaxProcs)
+	if os.Getenv("GOMAXPROCS") == "" && params.GoMaxProcs > 0 {
+		logCtx.WithField("config", params.GoMaxProcs).Info("Setting GOMAXPROCS from configuration.")
+		runtime.GOMAXPROCS(params.GoMaxProcs)
+	} else {
+		logCtx.Info("Using runtime default GOMAXPROCS.")
+	}
 }
 
 func monitorAndManageShutdown(failureReportChan <-chan string, driverCmd *exec.Cmd, stopSignalChans []chan<- *sync.WaitGroup) {
@@ -944,17 +1028,20 @@ type DataplaneConnector struct {
 	configLock sync.Mutex
 	config     *config.Config
 
-	configUpdChan              chan<- map[string]string
-	ToDataplane                chan interface{}
-	StatusUpdatesFromDataplane chan interface{}
-	InSync                     chan bool
-	failureReportChan          chan<- string
-	dataplane                  dp.DataplaneDriver
-	datastore                  bapi.Client
-	datastorev3                client.Interface
-	statusReporter             *statusrep.EndpointStatusReporter
+	configUpdChan chan<- map[string]string
+	ToDataplane   chan interface{}
+	InSync        chan bool
 
-	datastoreInSync bool
+	// Input channel for msgs from the dataplane.
+	// Msgs popped off this channel are dispatched to all StatusUpdatesFromDataplaneConsumers.
+	statusUpdatesFromDataplane           chan interface{}
+	statusUpdatesFromDataplaneDispatcher *dispatcher.BlockingDispatcher[interface{}]
+	statusUpdatesFromDataplaneConsumers  []chan interface{}
+
+	failureReportChan chan<- string
+	dataplane         dp.DataplaneDriver
+	datastore         bapi.Client
+	datastorev3       client.Interface
 
 	firstStatusReportSent bool
 
@@ -973,18 +1060,34 @@ func newConnector(configParams *config.Config,
 	failureReportChan chan<- string,
 ) *DataplaneConnector {
 	felixConn := &DataplaneConnector{
-		config:                           configParams,
-		configUpdChan:                    configUpdChan,
-		datastore:                        datastore,
-		datastorev3:                      datastorev3,
-		ToDataplane:                      make(chan interface{}),
-		StatusUpdatesFromDataplane:       make(chan interface{}),
-		InSync:                           make(chan bool, 1),
-		failureReportChan:                failureReportChan,
-		dataplane:                        dataplane,
-		wireguardStatUpdateFromDataplane: make(chan *proto.WireguardStatusUpdate, 1),
+		config:                              configParams,
+		configUpdChan:                       configUpdChan,
+		datastore:                           datastore,
+		datastorev3:                         datastorev3,
+		ToDataplane:                         make(chan interface{}),
+		statusUpdatesFromDataplane:          make(chan interface{}),
+		statusUpdatesFromDataplaneConsumers: nil,
+		failureReportChan:                   failureReportChan,
+		dataplane:                           dataplane,
+		wireguardStatUpdateFromDataplane:    make(chan *proto.WireguardStatusUpdate, 1),
 	}
+
+	fromDataplaneDispatcher, err := dispatcher.NewBlockingDispatcher[interface{}](felixConn.statusUpdatesFromDataplane)
+	if err != nil {
+		log.WithError(err).Panic("Failed to create dispatcher for status updates from dataplane")
+	}
+	felixConn.statusUpdatesFromDataplaneDispatcher = fromDataplaneDispatcher
+
 	return felixConn
+}
+
+// NewFromDataplaneConsumer creates a channel which receives status updates from the dataplane.
+// Each call creates a new consumer channel, and each consumer is dispatched dataplane msgs in series.
+// So, it's important that all created chans are continuously drained to avoid deadlocking.
+func (fc *DataplaneConnector) NewFromDataplaneConsumer() <-chan interface{} {
+	fromDataplaneC := make(chan interface{}, 10)
+	fc.statusUpdatesFromDataplaneConsumers = append(fc.statusUpdatesFromDataplaneConsumers, fromDataplaneC)
+	return fromDataplaneC
 }
 
 func (fc *DataplaneConnector) readMessagesFromDataplane() {
@@ -1003,23 +1106,29 @@ func (fc *DataplaneConnector) readMessagesFromDataplane() {
 		case *proto.ProcessStatusUpdate:
 			fc.handleProcessStatusUpdate(context.TODO(), msg)
 		case *proto.WorkloadEndpointStatusUpdate:
-			if fc.statusReporter != nil {
-				fc.StatusUpdatesFromDataplane <- msg
+			if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+				fc.statusUpdatesFromDataplane <- msg
 			}
 		case *proto.WorkloadEndpointStatusRemove:
-			if fc.statusReporter != nil {
-				fc.StatusUpdatesFromDataplane <- msg
+			if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+				fc.statusUpdatesFromDataplane <- msg
 			}
 		case *proto.HostEndpointStatusUpdate:
-			if fc.statusReporter != nil {
-				fc.StatusUpdatesFromDataplane <- msg
+			if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+				fc.statusUpdatesFromDataplane <- msg
 			}
 		case *proto.HostEndpointStatusRemove:
-			if fc.statusReporter != nil {
-				fc.StatusUpdatesFromDataplane <- msg
+			if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+				fc.statusUpdatesFromDataplane <- msg
 			}
+		case *proto.DataplaneInSync:
+			if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+				fc.statusUpdatesFromDataplane <- msg
+			}
+
 		case *proto.WireguardStatusUpdate:
 			fc.wireguardStatUpdateFromDataplane <- msg
+
 		default:
 			log.WithField("msg", msg).Warning("Unknown message from dataplane")
 		}
@@ -1028,7 +1137,7 @@ func (fc *DataplaneConnector) readMessagesFromDataplane() {
 }
 
 func (fc *DataplaneConnector) handleProcessStatusUpdate(ctx context.Context, msg *proto.ProcessStatusUpdate) {
-	log.Debugf("Status update from dataplane driver: %v", *msg)
+	log.Debugf("Status update from dataplane driver: %v", msg)
 	statusReport := model.StatusReport{
 		Timestamp:     msg.IsoTimestamp,
 		UptimeSeconds: msg.Uptime,
@@ -1191,11 +1300,6 @@ func (fc *DataplaneConnector) sendMessagesToDataplaneDriver() {
 		switch msg := msg.(type) {
 		case *proto.InSync:
 			log.Info("Datastore now in sync.")
-			if !fc.datastoreInSync {
-				log.Info("Datastore in sync for first time, sending message to status reporter.")
-				fc.datastoreInSync = true
-				fc.InSync <- true
-			}
 		case *proto.ConfigUpdate:
 			fc.handleConfigUpdate(msg)
 		case *calc.DatastoreNotReady:
@@ -1229,6 +1333,10 @@ func (fc *DataplaneConnector) shutDownProcess(reason string) {
 	log.Panic("Managed shutdown failed. Panicking.")
 }
 
+// Start creates goroutines for:
+// - sending calc-graph messages to the dataplane driver,
+// - reading messages from the dataplane (and broadcasting to all consumers of those messages),
+// - reading wireguard status updates from the dataplane
 func (fc *DataplaneConnector) Start() {
 	// Start a background thread to write to the dataplane driver.
 	go fc.sendMessagesToDataplaneDriver()
@@ -1238,6 +1346,17 @@ func (fc *DataplaneConnector) Start() {
 
 	// Start a background thread to handle Wireguard update to Node.
 	go fc.handleWireguardStatUpdateFromDataplane()
+
+	log.WithFields(log.Fields{
+		"statusUpdatesFromDataplaneConsumers": len(fc.statusUpdatesFromDataplaneConsumers),
+	}).Debug("DataplaneConnector starting.")
+
+	// Begin consuming StatusUpdatesFromDataplane and dispatching to downstream components (e.g. status reporter).
+	if len(fc.statusUpdatesFromDataplaneConsumers) > 0 {
+		ctx := context.Background()
+		log.Debug("Starting StatusUpdatesFromDataplaneDispatcher")
+		go fc.statusUpdatesFromDataplaneDispatcher.DispatchForever(ctx, fc.statusUpdatesFromDataplaneConsumers...)
+	}
 }
 
 func (fc *DataplaneConnector) handleConfigUpdate(msg *proto.ConfigUpdate) {

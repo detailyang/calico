@@ -18,7 +18,6 @@ package libbpf
 
 import (
 	"runtime"
-	"time"
 )
 
 type Obj struct {
@@ -35,6 +34,14 @@ func (m *Map) Name() string {
 }
 
 func (m *Map) Type() int {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) ValueSize() int {
+	panic("LIBBPF syscall stub")
+}
+
+func (m *Map) KeySize() int {
 	panic("LIBBPF syscall stub")
 }
 
@@ -66,7 +73,7 @@ func DetachClassifier(ifindex, handle, pref int, ingress bool) error {
 	panic("LIBBPF syscall stub")
 }
 
-func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, int, error) {
+func (o *Obj) AttachClassifier(secName, ifName string, ingress bool, prio int) (int, int, int, error) {
 	panic("LIBBPF syscall stub")
 }
 
@@ -127,19 +134,9 @@ const (
 	GlobalsRPFOptionEnabled uint32 = 16
 	GlobalsRPFOptionStrict  uint32 = 32
 	GlobalsNoDSRCidrs       uint32 = 12345
+	GlobalsLoUDPOnly        uint32 = 12345
+	GlobalsRedirectPeer     uint32 = 12345
 )
-
-func TcSetGlobals(_ *Map, globalData *TcGlobalData) error {
-	panic("LIBBPF syscall stub")
-}
-
-func CTLBSetGlobals(_ *Map, _ time.Duration, _ bool) error {
-	panic("LIBBPF syscall stub")
-}
-
-func XDPSetGlobals(_ *Map, _ *XDPGlobalData) error {
-	panic("LIBBPF syscall stub")
-}
 
 func (m *Map) SetSize(size int) error {
 	panic("LIBBPF syscall stub")
@@ -154,5 +151,21 @@ func ObjPin(_ int, _ string) error {
 }
 
 func ObjGet(_ string) (int, error) {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *TcGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *XDPGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *CTCleanupGlobalData) Set(m *Map) error {
+	panic("LIBBPF syscall stub")
+}
+
+func (t *CTLBGlobalData) Set(m *Map) error {
 	panic("LIBBPF syscall stub")
 }

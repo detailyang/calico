@@ -16,8 +16,10 @@ package workload
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"regexp"
@@ -26,19 +28,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
-
-	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
 
 	"github.com/projectcalico/calico/felix/fv/connectivity"
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/tcpdump"
 	"github.com/projectcalico/calico/felix/fv/utils"
+	api "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 type Workload struct {
@@ -46,6 +48,7 @@ type Workload struct {
 	Name                  string
 	InterfaceName         string
 	IP                    string
+	IP6                   string
 	Ports                 string
 	DefaultPort           string
 	runCmd                *exec.Cmd
@@ -61,6 +64,7 @@ type Workload struct {
 	isRunning             bool
 	isSpoofing            bool
 	listenAnyIP           bool
+	pid                   string
 
 	cleanupLock sync.Mutex
 }
@@ -93,18 +97,29 @@ func (w *Workload) Stop() {
 	if w == nil {
 		log.Info("Stop no-op because nil workload")
 	} else {
-		log.WithField("workload", w).Info("Stop")
-		output, err := w.C.ExecOutput("cat", fmt.Sprintf("/tmp/%v", w.Name))
-		Expect(err).NotTo(HaveOccurred(), "failed to run docker exec command to get workload pid")
-		pid := strings.TrimSpace(output)
-		w.C.Exec("kill", pid)
-		_ = w.C.ExecMayFail("ip", "link", "del", w.InterfaceName)
-		_ = w.C.ExecMayFail("ip", "netns", "del", w.NamespaceID())
-		_, err = w.runCmd.Process.Wait()
-		if err != nil {
-			log.WithField("workload", w).Error("failed to wait for process")
+		log.WithField("workload", w.Name).Info("Stop")
+		_ = w.C.ExecMayFail("sh", "-c", fmt.Sprintf("kill -9 %s & ip link del %s & ip netns del %s & wait", w.pid, w.InterfaceName, w.NamespaceID()))
+		// Killing the process inside the container should cause our long-running
+		// docker exec command to exit.  Do the Wait on a background goroutine,
+		// so we can time it out, just in case.
+		waitDone := make(chan struct{})
+		go func() {
+			defer close(waitDone)
+			_, err := w.runCmd.Process.Wait()
+			if err != nil {
+				log.WithField("workload", w.Name).Error("Failed to wait for docker exec, attempting to kill it.")
+				_ = w.runCmd.Process.Kill()
+			}
+		}()
+
+		select {
+		case <-waitDone:
+			log.WithField("workload", w.Name).Info("Workload stopped")
+		case <-time.After(10 * time.Second):
+			log.WithField("workload", w.Name).Error("Workload docker exec failed to exit?  Killing it.")
+			_ = w.runCmd.Process.Kill()
 		}
-		log.WithField("workload", w).Info("Workload now stopped")
+
 		w.isRunning = false
 	}
 }
@@ -128,9 +143,23 @@ func WithMTU(mtu int) Opt {
 	}
 }
 
+func WithIPv6Address(ipv6 string) Opt {
+	return func(w *Workload) {
+		w.IP6 = ipv6
+	}
+}
+
 func WithListenAnyIP() Opt {
 	return func(w *Workload) {
 		w.listenAnyIP = true
+	}
+}
+
+// WithHostNetworked force the workload to be host-networked even if the listen IP is
+// different than the host IP.
+func WithHostNetworked() Opt {
+	return func(w *Workload) {
+		w.InterfaceName = ""
 	}
 }
 
@@ -140,7 +169,7 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opt
 	interfaceName := conversion.NewConverter().VethNameForWorkload(profile, n)
 	spoofN := fmt.Sprintf("%s-spoof%v", name, workloadIdx)
 	spoofIfaceName := conversion.NewConverter().VethNameForWorkload(profile, spoofN)
-	if c.IP == ip {
+	if c.IP == ip || c.IPv6 == ip {
 		interfaceName = ""
 		spoofIfaceName = ""
 	}
@@ -164,10 +193,10 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opt
 	workload := &Workload{
 		C:                  c.Container,
 		Name:               n,
+		IP:                 ip,
 		SpoofName:          spoofN,
 		InterfaceName:      interfaceName,
 		SpoofInterfaceName: spoofIfaceName,
-		IP:                 ip,
 		Ports:              ports,
 		Protocol:           protocol,
 		WorkloadEndpoint:   wep,
@@ -176,6 +205,10 @@ func New(c *infrastructure.Felix, name, profile, ip, ports, protocol string, opt
 
 	for _, o := range opts {
 		o(workload)
+	}
+
+	if workload.IP6 != "" {
+		wep.Spec.IPNetworks = append(wep.Spec.IPNetworks, workload.IP6+"/128")
 	}
 
 	c.Workloads = append(c.Workloads, workload)
@@ -197,11 +230,14 @@ func (w *Workload) Start() error {
 		protoArg = "--protocol=" + w.Protocol
 	}
 
-	command := fmt.Sprintf("echo $$ > /tmp/%v; exec test-workload %v '%v' '%v' '%v'",
-		w.Name,
+	wIP := w.IP
+	if w.IP6 != "" {
+		wIP = wIP + "," + w.IP6
+	}
+	command := fmt.Sprintf("echo $$; exec test-workload %v '%v' '%v' '%v'",
 		protoArg,
 		w.InterfaceName,
-		w.IP,
+		wIP,
 		w.Ports,
 	)
 
@@ -241,18 +277,25 @@ func (w *Workload) Start() error {
 				log.WithError(err).Info("End of workload stderr")
 				return
 			}
-			log.Infof("Workload %s stderr: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stderr] %v", w.Name, line)
 		}
 	}()
+
+	pid, err := stdoutReader.ReadString('\n')
+	if err != nil {
+		// (Only) if we fail here, wait for the stderr to be output before returning.
+		defer errDone.Wait()
+		return fmt.Errorf("reading PID from stdout failed: %w", err)
+	}
+	w.pid = strings.TrimSpace(pid)
 
 	namespacePath, err := stdoutReader.ReadString('\n')
 	if err != nil {
 		// (Only) if we fail here, wait for the stderr to be output before returning.
 		defer errDone.Wait()
-		if err != nil {
-			return fmt.Errorf("Reading from stdout failed: %v", err)
-		}
+		return fmt.Errorf("reading from stdout failed: %w", err)
 	}
+	log.WithField("workload", w.Name).Infof("Workload namespace path: %s", namespacePath)
 
 	w.namespacePath = strings.TrimSpace(namespacePath)
 
@@ -263,7 +306,7 @@ func (w *Workload) Start() error {
 				log.WithError(err).Info("End of workload stdout")
 				return
 			}
-			log.Infof("Workload %s stdout: %s", w.Name, strings.TrimSpace(string(line)))
+			_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "%v[stdout] %v", w.Name, line)
 		}
 	}()
 
@@ -332,7 +375,9 @@ func (w *Workload) RemoveFromDatastore(client client.Interface) {
 // ConfigureInInfra creates the workload endpoint for this Workload.
 func (w *Workload) ConfigureInInfra(infra infrastructure.DatastoreInfra) {
 	wep := w.WorkloadEndpoint
-	wep.Namespace = "default"
+	if wep.Namespace == "" {
+		wep.Namespace = "default"
+	}
 	wep.Spec.Workload = w.Name
 	wep.Spec.Endpoint = w.Name
 	wep.Spec.InterfaceName = w.InterfaceName
@@ -391,7 +436,14 @@ func (w *Workload) SourceName() string {
 }
 
 func (w *Workload) SourceIPs() []string {
-	return []string{w.IP}
+	ips := []string{}
+	if w.IP != "" {
+		ips = append(ips, w.IP)
+	}
+	if w.IP6 != "" {
+		ips = append(ips, w.IP6)
+	}
+	return ips
 }
 
 func (w *Workload) PreRetryCleanup(ip, port, protocol string, opts ...connectivity.CheckOption) {
@@ -452,8 +504,9 @@ func (w *Workload) LatencyTo(ip, port string) (time.Duration, string) {
 	}
 	out, err := w.ExecOutput("hping3", "-p", port, "-c", "20", "--fast", "-S", "-n", ip)
 	stderr := ""
-	if err, ok := err.(*exec.ExitError); ok {
-		stderr = string(err.Stderr)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr = string(exitErr.Stderr)
 	}
 	Expect(err).NotTo(HaveOccurred(), stderr)
 
@@ -488,8 +541,9 @@ func (w *Workload) SendPacketsTo(ip string, count int, size int) (error, string)
 	s := fmt.Sprintf("%d", size)
 	_, err := w.ExecOutput("ping", "-c", c, "-W", "1", "-s", s, ip)
 	stderr := ""
-	if err, ok := err.(*exec.ExitError); ok {
-		stderr = string(err.Stderr)
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		stderr = string(exitErr.Stderr)
 	}
 	return err, stderr
 }
@@ -546,7 +600,6 @@ func startSideService(w *Workload) (*SideService, error) {
 	}
 	testWorkloadShArgs = append(testWorkloadShArgs,
 		"--sidecar-iptables",
-		"--up-lo",
 		fmt.Sprintf("'--namespace-path=%s'", w.namespacePath),
 		"''", // interface name, not important
 		"127.0.0.1",
@@ -583,8 +636,10 @@ type PersistentConnectionOpts struct {
 	Timeout             time.Duration
 }
 
-func (w *Workload) StartPersistentConnection(ip string, port int,
-	opts PersistentConnectionOpts) *connectivity.PersistentConnection {
+func (w *Workload) StartPersistentConnection(
+	ip string, port int,
+	opts PersistentConnectionOpts,
+) *connectivity.PersistentConnection {
 
 	pc := &connectivity.PersistentConnection{
 		RuntimeName:         w.C.Name,
@@ -617,6 +672,7 @@ func (w *Workload) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 	}
 	return &connectivity.Matcher{
 		IP:         w.IP,
+		IP6:        w.IP6,
 		Port:       port,
 		TargetName: fmt.Sprintf("%s on port %s", w.Name, port),
 		Protocol:   "tcp",
@@ -778,6 +834,7 @@ func (p *Port) ToMatcher(explicitPort ...uint16) *connectivity.Matcher {
 		IP:         p.Workload.IP,
 		Port:       fmt.Sprint(p.Port),
 		TargetName: fmt.Sprintf("%s on port %d", p.Workload.Name, p.Port),
+		IP6:        p.Workload.IP6,
 	}
 }
 
@@ -788,4 +845,31 @@ func (w *Workload) InterfaceIndex() int {
 	Expect(err).NotTo(HaveOccurred())
 	log.Infof("%v is ifindex %v", w.InterfaceName, ifIndex)
 	return ifIndex
+}
+
+func (w *Workload) RenameInterface(from, to string) {
+	var err error
+	sleep := 100 * time.Millisecond
+	for try := 0; try < 40; try++ {
+		// Can fail with EBUSY.
+		err = w.C.ExecMayFail("ip", "link", "set", from, "name", to)
+		if err == nil {
+			return
+		}
+		time.Sleep(sleep)
+		sleep = time.Duration(float64(sleep) * (1.5 + rand.Float64()))
+		const maxSleep = 2 * time.Second
+		if sleep > maxSleep {
+			sleep = maxSleep
+		}
+	}
+	ginkgo.Fail(fmt.Sprintf("Failed to rename interface %s to %s after several retries: %s", from, to, err))
+}
+
+func (w *Workload) SetInterfaceUp(b bool) {
+	if b {
+		w.C.Exec("ip", "link", "set", "up", w.InterfaceName)
+	} else {
+		w.C.Exec("ip", "link", "set", "down", w.InterfaceName)
+	}
 }

@@ -33,24 +33,30 @@ const DetachedID = 0
 
 type AttachPoint struct {
 	bpf.AttachPoint
-	HookLayout hook.Layout
+	HookLayoutV4 hook.Layout
+	HookLayoutV6 hook.Layout
 
 	Modes []bpf.XDPMode
 }
 
 func (ap *AttachPoint) PolicyAllowJumpIdx(family int) int {
-	if ap.HookLayout != nil {
-		return ap.HookLayout[hook.SubProgXDPAllowed]
+	if family == 4 && ap.HookLayoutV4 != nil {
+		return ap.HookLayoutV4[hook.SubProgXDPAllowed]
 	}
-
+	if family == 6 && ap.HookLayoutV6 != nil {
+		return ap.HookLayoutV6[hook.SubProgXDPAllowed]
+	}
 	return -1
 }
 
 func (ap *AttachPoint) PolicyDenyJumpIdx(family int) int {
-	if ap.HookLayout != nil {
-		return ap.HookLayout[hook.SubProgXDPDrop]
+	if family == 4 && ap.HookLayoutV4 != nil {
+		return ap.HookLayoutV4[hook.SubProgXDPDrop]
 	}
 
+	if family == 6 && ap.HookLayoutV6 != nil {
+		return ap.HookLayoutV6[hook.SubProgXDPDrop]
+	}
 	return -1
 }
 
@@ -103,57 +109,39 @@ func (ap *AttachPoint) AlreadyAttached(object string) (int, bool) {
 	return -1, false
 }
 
-func ConfigureProgram(m *libbpf.Map, iface string, globalData *libbpf.XDPGlobalData) error {
-	in := []byte("---------------")
-	copy(in, iface)
-	globalData.IfaceName = string(in)
-
-	if err := libbpf.XDPSetGlobals(m, globalData); err != nil {
-		return fmt.Errorf("failed to configure xdp: %w", err)
-	}
-
-	return nil
-}
-
 type AttachResult int
 
 func (ar AttachResult) ProgID() int {
 	return int(ar)
 }
 
+func (ap *AttachPoint) Configuration() *libbpf.XDPGlobalData {
+	globalData := &libbpf.XDPGlobalData{}
+	if ap.HookLayoutV4 != nil {
+		for p, i := range ap.HookLayoutV4 {
+			globalData.Jumps[p] = uint32(i)
+		}
+		globalData.Jumps[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV4)
+	}
+	if ap.HookLayoutV6 != nil {
+		for p, i := range ap.HookLayoutV6 {
+			globalData.JumpsV6[p] = uint32(i)
+		}
+		globalData.JumpsV6[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdxV6)
+	}
+	in := []byte("---------------")
+	copy(in, ap.Iface)
+	globalData.IfaceName = string(in)
+
+	return globalData
+}
+
 func (ap *AttachPoint) AttachProgram() (bpf.AttachResult, error) {
 	// By now the attach type specific generic set of programs is loaded and we
 	// only need to load and configure the preamble that will pass the
 	// configuration further to the selected set of programs.
+
 	binaryToLoad := path.Join(bpfdefs.ObjectDir, "xdp_preamble.o")
-
-	obj, err := libbpf.OpenObject(binaryToLoad)
-	if err != nil {
-		return nil, err
-	}
-	defer obj.Close()
-
-	for m, err := obj.FirstMap(); m != nil && err == nil; m, err = m.NextMap() {
-		if m.IsMapInternal() {
-			var globals libbpf.XDPGlobalData
-
-			for p, i := range ap.HookLayout {
-				globals.Jumps[p] = uint32(i)
-			}
-			globals.Jumps[tcdefs.ProgIndexPolicy] = uint32(ap.PolicyIdx(4))
-
-			if err := ConfigureProgram(m, ap.Iface, &globals); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		// TODO: We need to set map size here like tc.
-		pinDir := bpf.MapPinDir(m.Type(), m.Name(), ap.Iface, hook.XDP)
-		if err := m.SetPinPath(path.Join(pinDir, m.Name())); err != nil {
-			return nil, fmt.Errorf("error pinning map %s: %w", m.Name(), err)
-		}
-	}
-
 	// Check if the bpf object is already attached, and we should skip re-attaching it
 	progID, isAttached := ap.AlreadyAttached(binaryToLoad)
 	if isAttached {
@@ -161,10 +149,9 @@ func (ap *AttachPoint) AttachProgram() (bpf.AttachResult, error) {
 		return AttachResult(progID), nil
 	}
 	ap.Log().Infof("Continue with attaching BPF program %s", binaryToLoad)
-
-	if err := obj.Load(); err != nil {
-		ap.Log().Warn("Failed to load program")
-		return nil, fmt.Errorf("error loading program: %w", err)
+	obj, err := bpf.LoadObject(binaryToLoad, ap.Configuration())
+	if err != nil {
+		return nil, fmt.Errorf("error loading %s:%w", binaryToLoad, err)
 	}
 
 	oldID, err := ap.ProgramID()

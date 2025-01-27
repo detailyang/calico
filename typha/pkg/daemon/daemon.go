@@ -16,8 +16,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -30,10 +28,7 @@ import (
 	"github.com/docopt/docopt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -42,7 +37,9 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/nodestatussyncer"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/tunnelipsyncer"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/debugserver"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
+	"github.com/projectcalico/calico/libcalico-go/lib/metricsserver"
 	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator"
 	"github.com/projectcalico/calico/libcalico-go/lib/upgrade/migrator/clients"
 	"github.com/projectcalico/calico/typha/pkg/buildinfo"
@@ -144,9 +141,6 @@ func (t *TyphaDaemon) InitializeAndServeForever(cxt context.Context) error {
 
 // DoEarlyRuntimeSetup does early runtime/logging configuration that needs to happen before we do any work.
 func (t *TyphaDaemon) DoEarlyRuntimeSetup() {
-	// Go's RNG is not seeded by default.  Do that now.
-	seedrng.EnsureSeeded()
-
 	// Special-case handling for environment variable-configured logging:
 	// Initialise early so we can trace out config parsing.
 	t.ConfigureEarlyLogging()
@@ -394,6 +388,7 @@ func (t *TyphaDaemon) CreateServer() {
 			NewClientFallBehindGracePeriod: t.ConfigParams.ServerNewClientFallBehindGracePeriod,
 			PingInterval:                   t.ConfigParams.ServerPingIntervalSecs,
 			PongTimeout:                    t.ConfigParams.ServerPongTimeoutSecs,
+			HandshakeTimeout:               t.ConfigParams.ServerHandshakeTimeoutSecs,
 			DropInterval:                   t.ConfigParams.ConnectionDropIntervalSecs,
 			ShutdownTimeout:                t.ConfigParams.ShutdownTimeoutSecs,
 			ShutdownMaxDropInterval:        t.ConfigParams.ShutdownConnectionDropIntervalMaxSecs,
@@ -427,9 +422,16 @@ func (t *TyphaDaemon) Start(cxt context.Context) {
 	}
 	log.Info("Started the datastore Syncer/cache layer/server.")
 
+	if t.ConfigParams.DebugPort != 0 {
+		debugserver.StartDebugPprofServer(t.ConfigParams.DebugHost, t.ConfigParams.DebugPort)
+	}
 	if t.ConfigParams.PrometheusMetricsEnabled {
 		log.Info("Prometheus metrics enabled.  Starting server.")
-		go servePrometheusMetrics(t.ConfigParams)
+		t.configurePrometheusMetrics()
+		go metricsserver.ServePrometheusMetricsForever(
+			t.ConfigParams.PrometheusMetricsHost,
+			t.ConfigParams.PrometheusMetricsPort,
+		)
 	}
 
 	if t.ConfigParams.HealthEnabled {
@@ -438,6 +440,21 @@ func (t *TyphaDaemon) Start(cxt context.Context) {
 			"port": t.ConfigParams.HealthPort,
 		}).Info("Health enabled.  Starting server.")
 		t.healthAggregator.ServeHTTP(t.ConfigParams.HealthEnabled, t.ConfigParams.HealthHost, t.ConfigParams.HealthPort)
+	}
+}
+
+func (t *TyphaDaemon) configurePrometheusMetrics() {
+	if t.ConfigParams.PrometheusGoMetricsEnabled && t.ConfigParams.PrometheusProcessMetricsEnabled {
+		log.Info("Including Golang & Process metrics")
+	} else {
+		if !t.ConfigParams.PrometheusGoMetricsEnabled {
+			log.Info("Discarding Golang metrics")
+			prometheus.Unregister(collectors.NewGoCollector())
+		}
+		if !t.ConfigParams.PrometheusProcessMetricsEnabled {
+			log.Info("Discarding process metrics")
+			prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		}
 	}
 }
 
@@ -546,33 +563,5 @@ func dumpHeapMemoryProfile(configParams *config.Config) {
 			}
 			logCxt.Info("Finished writing memory profile")
 		}
-	}
-}
-
-// TODO Typha: Share with Felix.
-func servePrometheusMetrics(configParams *config.Config) {
-	for {
-		log.WithFields(log.Fields{
-			"host": configParams.PrometheusMetricsHost,
-			"port": configParams.PrometheusMetricsPort,
-		}).Info("Starting prometheus metrics endpoint")
-		if configParams.PrometheusGoMetricsEnabled && configParams.PrometheusProcessMetricsEnabled {
-			log.Info("Including Golang & Process metrics")
-		} else {
-			if !configParams.PrometheusGoMetricsEnabled {
-				log.Info("Discarding Golang metrics")
-				prometheus.Unregister(collectors.NewGoCollector())
-			}
-			if !configParams.PrometheusProcessMetricsEnabled {
-				log.Info("Discarding process metrics")
-				prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-			}
-		}
-		http.Handle("/metrics", promhttp.Handler())
-		err := http.ListenAndServe(fmt.Sprintf("[%v]:%v",
-			configParams.PrometheusMetricsHost, configParams.PrometheusMetricsPort), nil)
-		log.WithError(err).Error(
-			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1 * time.Second)
 	}
 }

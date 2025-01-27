@@ -24,6 +24,11 @@ ifeq ($(ARCHES),)
 	ARCHES=$(patsubst Dockerfile.%,%,$(wildcard Dockerfile.*))
 endif
 
+# If architectures cannot infer from Dockerfiles, set default supported architecture.
+ifeq ($(ARCHES),)
+	ARCHES=amd64 arm64 ppc64le s390x
+endif
+
 # list of arches *not* to build when doing *-all
 EXCLUDEARCH?=
 VALIDARCHES = $(filter-out $(EXCLUDEARCH),$(ARCHES))
@@ -47,9 +52,6 @@ endif
 ifeq ($(BUILDARCH),x86_64)
 	BUILDARCH=amd64
 endif
-ifeq ($(BUILDARCH),armv7l)
-        BUILDARCH=armv7
-endif
 
 # unless otherwise set, I am building for my own architecture, i.e. not cross-compiling
 ARCH ?= $(BUILDARCH)
@@ -61,17 +63,6 @@ endif
 ifeq ($(ARCH),x86_64)
 	override ARCH=amd64
 endif
-ifeq ($(ARCH),armv7l)
-        override ARCH=armv7
-endif
-ifeq ($(ARCH),armhfv7)
-        override ARCH=armv7
-endif
-
-# If ARCH is arm based, find the requested version/variant
-ifeq ($(word 1,$(subst v, ,$(ARCH))),arm)
-ARM_VERSION := $(word 2,$(subst v, ,$(ARCH)))
-endif
 
 # detect the local outbound ip address
 LOCAL_IP_ENV?=$(shell ip route get 8.8.8.8 | head -1 | awk '{print $$7}')
@@ -79,12 +70,8 @@ LOCAL_IP_ENV?=$(shell ip route get 8.8.8.8 | head -1 | awk '{print $$7}')
 LATEST_IMAGE_TAG?=latest
 
 # these macros create a list of valid architectures for pushing manifests
-space :=
-space +=
 comma := ,
 double_quote := $(shell echo '"')
-prefix_linux = $(addprefix linux/,$(strip $(subst armv,arm/v,$1)))
-join_platforms = $(subst $(space),$(comma),$(call prefix_linux,$(strip $1)))
 
 ## Targets used when cross building.
 .PHONY: native register
@@ -161,27 +148,6 @@ else
 CGO_ENABLED?=0
 endif
 
-# Build a static binary with boring crypto support.
-# This function expects you to pass in two arguments:
-#   1st arg: path/to/input/package(s)
-#   2nd arg: path/to/output/binary
-# Only when arch = amd64 it will use boring crypto to build the binary.
-# Uses LDFLAGS, CGO_LDFLAGS, CGO_CFLAGS when set.
-# Tests that the resulting binary contains boringcrypto symbols.
-define build_static_cgo_boring_binary
-    $(DOCKER_RUN) \
-        -e CGO_ENABLED=1 \
-        -e CGO_LDFLAGS=$(CGO_LDFLAGS) \
-        -e CGO_CFLAGS=$(CGO_CFLAGS) \
-        $(GO_BUILD_IMAGE):$(GO_BUILD_VER) \
-        sh -c '$(GIT_CONFIG_SSH) \
-            GOEXPERIMENT=boringcrypto go build -o $(2)  \
-            -tags fipsstrict,osusergo,netgo -v -buildvcs=false \
-            -ldflags "$(LDFLAGS) -linkmode external -extldflags -static" \
-            $(1) \
-            && go tool nm $(2) | grep '_Cfunc__goboringcrypto_' 1> /dev/null'
-endef
-
 # Build a binary with boring crypto support.
 # This function expects you to pass in two arguments:
 #   1st arg: path/to/input/package(s)
@@ -190,56 +156,44 @@ endef
 # Uses LDFLAGS, CGO_LDFLAGS, CGO_CFLAGS when set.
 # Tests that the resulting binary contains boringcrypto symbols.
 define build_cgo_boring_binary
-    $(DOCKER_RUN) \
-        -e CGO_ENABLED=1 \
-        -e CGO_LDFLAGS=$(CGO_LDFLAGS) \
-        -e CGO_CFLAGS=$(CGO_CFLAGS) \
-        $(GO_BUILD_IMAGE):$(GO_BUILD_VER) \
-        sh -c '$(GIT_CONFIG_SSH) \
-            GOEXPERIMENT=boringcrypto go build -o $(2)  \
-            -tags fipsstrict -v -buildvcs=false \
-            -ldflags "$(LDFLAGS)" \
-            $(1) \
-            && go tool nm $(2) | grep '_Cfunc__goboringcrypto_' 1> /dev/null'
+	$(DOCKER_RUN) \
+		-e CGO_ENABLED=1 \
+		-e CGO_CFLAGS=$(CGO_CFLAGS) \
+		-e CGO_LDFLAGS=$(CGO_LDFLAGS) \
+		$(CALICO_BUILD) \
+		sh -c '$(GIT_CONFIG_SSH) GOEXPERIMENT=boringcrypto go build -o $(2) -tags fipsstrict -v -buildvcs=false -ldflags "$(LDFLAGS)" $(1) \
+			&& go tool nm $(2) | grep '_Cfunc__goboringcrypto_' 1> /dev/null'
 endef
 
 # Use this when building binaries that need cgo, but have no crypto and therefore would not contain any boring symbols.
 define build_cgo_binary
-    $(DOCKER_RUN) \
-        -e CGO_ENABLED=1 \
-        -e CGO_LDFLAGS=$(CGO_LDFLAGS) \
-        -e CGO_CFLAGS=$(CGO_CFLAGS) \
-        $(GO_BUILD_IMAGE):$(GO_BUILD_VER) \
-        sh -c '$(GIT_CONFIG_SSH) \
-            go build -o $(2)  \
-            -v -buildvcs=false \
-            -ldflags "$(LDFLAGS)" \
-            $(1)'
+	$(DOCKER_RUN) \
+		-e CGO_ENABLED=1 \
+		-e CGO_CFLAGS=$(CGO_CFLAGS) \
+		-e CGO_LDFLAGS=$(CGO_LDFLAGS) \
+		$(CALICO_BUILD) \
+		sh -c '$(GIT_CONFIG_SSH) go build -o $(2) -v -buildvcs=false -ldflags "$(LDFLAGS)" $(1)'
 endef
 
 # For binaries that do not require boring crypto.
 define build_binary
-	$(DOCKER_RUN) $(GO_BUILD_IMAGE):$(GO_BUILD_VER) \
-		sh -c '$(GIT_CONFIG_SSH) \
-		go build -o $(2)  \
-		-v -buildvcs=false \
-		-ldflags "$(LDFLAGS)" \
-		$(1)'
+	$(DOCKER_RUN) \
+		-e CGO_ENABLED=0 \
+		$(CALICO_BUILD) \
+		sh -c '$(GIT_CONFIG_SSH) go build -o $(2) -v -buildvcs=false -ldflags "$(LDFLAGS)" $(1)'
 endef
 
-# For binaries that do not require boring crypto.
-define build_static_binary
-        $(DOCKER_RUN) $(GO_BUILD_IMAGE):$(GO_BUILD_VER) \
-                sh -c '$(GIT_CONFIG_SSH) \
-                go build -o $(2)  \
-                -v -buildvcs=false \
-                -ldflags "$(LDFLAGS) -linkmode external -extldflags -static" \
-                $(1)'
+# For windows builds that do not require cgo.
+define build_windows_binary
+	$(DOCKER_RUN) \
+		-e CGO_ENABLED=0 \
+		-e GOARCH=amd64 \
+		-e GOOS=windows \
+		$(CALICO_BUILD) \
+		sh -c '$(GIT_CONFIG_SSH) go build -o $(2) -v -buildvcs=false -ldflags "$(LDFLAGS)" $(1)'
 endef
-
 
 # Images used in build / test across multiple directories.
-PROTOC_CONTAINER=calico/protoc:$(PROTOC_VER)-$(BUILDARCH)
 ETCD_IMAGE ?= quay.io/coreos/etcd:$(ETCD_VERSION)-$(ARCH)
 ifeq ($(BUILDARCH),amd64)
 	# *-amd64 tagged images for etcd are not available until v3.5.0
@@ -251,8 +205,8 @@ ifeq ($(GIT_USE_SSH),true)
 	GIT_CONFIG_SSH ?= git config --global url."ssh://git@github.com/".insteadOf "https://github.com/";
 endif
 
-# Get version from git.
-GIT_VERSION:=$(shell git describe --tags --dirty --always --abbrev=12)
+# Get version from git. We allow setting this manually for the hashrelease process.
+GIT_VERSION ?= $(shell git describe --tags --dirty --always --abbrev=12)
 
 # Figure out version information.  To support builds from release tarballs, we default to
 # <unknown> if this isn't a git checkout.
@@ -264,7 +218,7 @@ BUILD_ID:=$(shell git rev-parse HEAD || uuidgen | sed 's/-//g')
 # Variables elsewhere that depend on this (such as LDFLAGS) must also be lazy.
 GIT_DESCRIPTION=$(shell git describe --tags --dirty --always --abbrev=12 || echo '<unknown>')
 
-# Calculate a timestamp for any build artefacts.
+# Calculate a timestamp for any build artifacts.
 ifneq ($(OS),Windows_NT)
 DATE:=$(shell date -u +'%FT%T%z')
 endif
@@ -302,34 +256,32 @@ EXTRA_DOCKER_ARGS += -v $(GOMOD_CACHE):/go/pkg/mod:rw
 
 # Define go architecture flags to support arm variants
 GOARCH_FLAGS :=-e GOARCH=$(ARCH)
-ifdef ARM_VERSION
-GOARCH_FLAGS :=-e GOARCH=arm -e GOARM=$(ARM_VERSION)
-endif
 
 # Location of certificates used in UTs.
 REPO_ROOT := $(shell git rev-parse --show-toplevel)
 CERTS_PATH := $(REPO_ROOT)/hack/test/certs
 
-# Set the platform correctly for building docker images so that
-# cross-builds get the correct architecture set in the produced images.
-ifeq ($(ARCH),arm64)
-TARGET_PLATFORM=--platform=linux/arm64/v8
+# The image to use for building calico/base-dependent modules (e.g. apiserver, typha).
+ifdef USE_UBI_AS_CALICO_BASE
+CALICO_BASE ?= $(UBI_IMAGE)
+else
+CALICO_BASE ?= calico/base
 endif
-ifeq ($(ARCH),armv7)
-TARGET_PLATFORM=--platform=linux/arm/v7
-endif
-ifeq ($(ARCH),ppc64le)
-TARGET_PLATFORM=--platform=linux/ppc64le
-endif
-ifeq ($(ARCH),s390x)
-TARGET_PLATFORM=--platform=linux/s390x
+
+QEMU_IMAGE ?= calico/qemu-user-static:latest
+
+ifndef NO_DOCKER_PULL
+DOCKER_PULL = --pull
+else
+DOCKER_PULL =
 endif
 
 # DOCKER_BUILD is the base build command used for building all images.
-DOCKER_BUILD=docker buildx build --pull \
-	     --build-arg QEMU_IMAGE=$(CALICO_BUILD) \
+DOCKER_BUILD=docker buildx build --load --platform=linux/$(ARCH) $(DOCKER_PULL)\
+	     --build-arg QEMU_IMAGE=$(QEMU_IMAGE) \
 	     --build-arg UBI_IMAGE=$(UBI_IMAGE) \
-	     --build-arg GIT_VERSION=$(GIT_VERSION) $(TARGET_PLATFORM)
+	     --build-arg GIT_VERSION=$(GIT_VERSION) \
+	     --build-arg CALICO_BASE=$(CALICO_BASE)
 
 DOCKER_RUN := mkdir -p ../.go-pkg-cache bin $(GOMOD_CACHE) && \
 	docker run --rm \
@@ -344,22 +296,6 @@ DOCKER_RUN := mkdir -p ../.go-pkg-cache bin $(GOMOD_CACHE) && \
 		-e GOOS=$(BUILDOS) \
 		-e GOFLAGS=$(GOFLAGS) \
 		-v $(REPO_ROOT):/go/src/github.com/projectcalico/calico:rw \
-		-v $(REPO_ROOT)/.go-pkg-cache:/go-cache:rw \
-		-w /go/src/$(PACKAGE_NAME)
-
-DOCKER_RUN_RO := mkdir -p .go-pkg-cache bin $(GOMOD_CACHE) && \
-	docker run --rm \
-		--net=host \
-		--init \
-		$(EXTRA_DOCKER_ARGS) \
-		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-		-e GOCACHE=/go-cache \
-		$(GOARCH_FLAGS) \
-		-e GOPATH=/go \
-		-e OS=$(BUILDOS) \
-		-e GOOS=$(BUILDOS) \
-		-e GOFLAGS=$(GOFLAGS) \
-		-v $(REPO_ROOT):/go/src/github.com/projectcalico/calico:ro \
 		-v $(REPO_ROOT)/.go-pkg-cache:/go-cache:rw \
 		-w /go/src/$(PACKAGE_NAME)
 
@@ -412,6 +348,31 @@ define update_replace_pin
 			$(GIT_CONFIG_SSH) \
 			go mod edit -replace $(original_repo)=$(replace_repo)@$(new_ver); \
 			go mod tidy; \
+		fi'
+endef
+
+# Get the latest release tag from projectcalico/go-build.
+GO_BUILD_REPO=https://github.com/projectcalico/go-build.git
+define get_go_build_version
+	$(shell git ls-remote --tags --refs --sort=-version:refname $(GO_BUILD_REPO) | head -n 1 | awk -F '/' '{print $$NF}')
+endef
+
+# update_go_build updates the GO_BUILD_VER in metadata.mk or Makefile.
+# for annotated git tags, we need to remove the trailing `^{}`.
+# for the obsoleted vx.y go-build version, we need to remove the leading `v` for bash string comparison to work properly.
+define update_go_build_pin
+	$(eval new_ver := $(subst ^{},,$(call get_go_build_version)))
+	$(eval old_ver := $(subst v,,$(shell grep -E "^GO_BUILD_VER" $(1) | cut -d'=' -f2 | xargs)))
+
+	@echo "current GO_BUILD_VER=$(old_ver)"
+	@echo "latest GO_BUILD_VER=$(new_ver)"
+
+	bash -c '\
+		if [[ "$(new_ver)" > "$(old_ver)" ]]; then \
+			sed -i "s/^GO_BUILD_VER[[:space:]]*=.*/GO_BUILD_VER=$(new_ver)/" $(1); \
+			echo "GO_BUILD_VER is updated to $(new_ver)"; \
+		else \
+			echo "no need to update GO_BUILD_VER"; \
 		fi'
 endef
 
@@ -471,6 +432,9 @@ update-cni-plugin-pin:
 replace-cni-pin:
 	$(call update_replace_pin,github.com/projectcalico/calico/cni-plugin,$(CNI_REPO),$(CNI_BRANCH))
 
+update-go-build-pin:
+	$(call update_go_build_pin,$(GIT_GO_BUILD_UPDATE_COMMIT_FILE))
+
 git-status:
 	git status --porcelain
 
@@ -497,26 +461,24 @@ git-commit:
 # different implementation.
 ###############################################################################
 
+ifdef LOCAL_CRANE
+CRANE_CMD         = bash -c $(double_quote)crane
+else
 CRANE_CMD         = docker run -t --entrypoint /bin/sh -v $(DOCKER_CONFIG):/root/.docker/config.json $(CALICO_BUILD) -c \
                     $(double_quote)crane
+endif
+
 GIT_CMD           = git
 DOCKER_CMD        = docker
-
-MANIFEST_TOOL_EXTRA_DOCKER_ARGS ?=
-# note that when using the MANIFEST_TOOL command you need to close the command with $(double_quote).
-MANIFEST_TOOL_CMD = docker run -t --entrypoint /bin/sh -v $(DOCKER_CONFIG):/root/.docker/config.json $(MANIFEST_TOOL_EXTRA_DOCKER_ARGS) $(CALICO_BUILD) -c \
-					  $(double_quote)/usr/bin/manifest-tool
 
 ifdef CONFIRM
 CRANE         = $(CRANE_CMD)
 GIT           = $(GIT_CMD)
 DOCKER        = $(DOCKER_CMD)
-MANIFEST_TOOL = $(MANIFEST_TOOL_CMD)
 else
 CRANE         = echo [DRY RUN] $(CRANE_CMD)
 GIT           = echo [DRY RUN] $(GIT_CMD)
 DOCKER        = echo [DRY RUN] $(DOCKER_CMD)
-MANIFEST_TOOL = echo [DRY RUN] $(MANIFEST_TOOL_CMD)
 endif
 
 commit-and-push-pr:
@@ -525,15 +487,16 @@ commit-and-push-pr:
 	$(GIT) push $(GIT_REMOTE) $(GIT_PR_BRANCH_HEAD)
 
 ###############################################################################
-# Github API helpers
+# GitHub API helpers
 #   Helper macros and targets to help with communicating with the github API
 ###############################################################################
 GIT_COMMIT_MESSAGE?="Automatic Pin Updates"
+GIT_COMMIT_TITLE?="Semaphore Auto Pin Update"
 GIT_PR_BRANCH_BASE?=$(SEMAPHORE_GIT_BRANCH)
 PIN_UPDATE_BRANCH?=semaphore-auto-pin-updates-$(GIT_PR_BRANCH_BASE)
 GIT_PR_BRANCH_HEAD?=$(PIN_UPDATE_BRANCH)
-GIT_REPO_SLUG?=$(SEMAPHORE_GIT_REPO_SLUG)
 GIT_PIN_UPDATE_COMMIT_FILES?=go.mod go.sum
+GIT_GO_BUILD_UPDATE_COMMIT_FILE?=metadata.mk
 GIT_PIN_UPDATE_COMMIT_EXTRA_FILES?=$(GIT_COMMIT_EXTRA_FILES)
 GIT_COMMIT_FILES?=$(GIT_PIN_UPDATE_COMMIT_FILES) $(GIT_PIN_UPDATE_COMMIT_EXTRA_FILES)
 
@@ -605,7 +568,7 @@ endif
 	git checkout -b $(GIT_PR_BRANCH_HEAD)
 
 create-pin-update-pr:
-	$(call github_pr_create,$(GIT_REPO_SLUG),[$(GIT_PR_BRANCH_BASE)] Semaphore Auto Pin Update,$(GIT_PR_BRANCH_HEAD),$(GIT_PR_BRANCH_BASE))
+	$(call github_pr_create,$(GIT_REPO_SLUG),[$(GIT_PR_BRANCH_BASE)] $(GIT_COMMIT_TITLE),$(GIT_PR_BRANCH_HEAD),$(GIT_PR_BRANCH_BASE))
 	echo 'Created pin update pull request $(PR_NUMBER)'
 
 # Add the "/merge-when-ready" comment to enable the "merge when ready" functionality, i.e. when the pull request is passing
@@ -642,7 +605,7 @@ trigger-auto-pin-update-process-wrapped: create-pin-update-head trigger-pin-upda
 .PHONY: static-checks
 ## Run static source code checks (lint, formatting, ...)
 static-checks: $(LOCAL_CHECKS)
-	$(MAKE) check-fmt golangci-lint
+	$(MAKE) golangci-lint
 
 LINT_ARGS ?= --max-issues-per-linter 0 --max-same-issues 0 --timeout 8m
 
@@ -650,13 +613,17 @@ LINT_ARGS ?= --max-issues-per-linter 0 --max-same-issues 0 --timeout 8m
 golangci-lint: $(GENERATED_FILES)
 	$(DOCKER_RUN) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) golangci-lint run $(LINT_ARGS)'
 
-.PHONY: go-fmt goimports fix
-fix go-fmt goimports:
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'find . -iname "*.go" ! -wholename "./vendor/*" | xargs goimports -w -local github.com/projectcalico/calico/'
+REPO_DIR=$(shell if [ -e hack/format-changed-files.sh ]; then echo '.'; else echo '..'; fi )
 
-check-fmt:
-	@echo "Checking code formatting.  Any listed files don't match goimports:"
-	$(DOCKER_RUN) $(CALICO_BUILD) bash -c 'exec 5>&1; ! [[ `find . -iname "*.go" ! -wholename "./vendor/*" | xargs goimports -l -local github.com/projectcalico/calico/ | tee >(cat >&5)` ]]'
+.PHONY: fix-changed go-fmt-changed goimports-changed
+# Format changed files only.
+fix-changed go-fmt-changed goimports-changed:
+	$(DOCKER_RUN) -e release_prefix=$(RELEASE_BRANCH_PREFIX)-v \
+	              -e git_repo_slug=$(GIT_REPO_SLUG) $(CALICO_BUILD) $(REPO_DIR)/hack/format-changed-files.sh
+
+.PHONY: fix-all go-fmt-all goimports-all
+fix-all go-fmt-all goimports-all:
+	$(DOCKER_RUN) $(CALICO_BUILD) $(REPO_DIR)/hack/format-all-files.sh
 
 .PHONY: pre-commit
 pre-commit:
@@ -899,7 +866,7 @@ retag-build-images-with-registry-%:
 # retag-build-image-with-registry-% retags the build arch images specified by $* and VALIDARCHES with the
 # registry specified by REGISTRY.
 retag-build-image-with-registry-%: var-require-all-REGISTRY-BUILD_IMAGES
-	$(MAKE) $(addprefix retag-build-image-arch-with-registry-,$(VALIDARCHES)) BUILD_IMAGE=$(call unescapefs,$*)
+	$(MAKE) -j12 $(addprefix retag-build-image-arch-with-registry-,$(VALIDARCHES)) BUILD_IMAGE=$(call unescapefs,$*)
 
 # retag-build-image-arch-with-registry-% retags the build / arch image specified by $* and BUILD_IMAGE with the
 # registry specified by REGISTRY.
@@ -922,38 +889,33 @@ push-images-to-registry-%:
 # push-image-to-registry-% pushes the build / arch images specified by $* and VALIDARCHES to the registry
 # specified by REGISTRY.
 push-image-to-registry-%:
-	$(MAKE) $(addprefix push-image-arch-to-registry-,$(VALIDARCHES)) BUILD_IMAGE=$(call unescapefs,$*)
+	$(MAKE) -j6 $(addprefix push-image-arch-to-registry-,$(VALIDARCHES)) BUILD_IMAGE=$(call unescapefs,$*)
 
 # push-image-arch-to-registry-% pushes the build / arch image specified by $* and BUILD_IMAGE to the registry
 # specified by REGISTRY.
 push-image-arch-to-registry-%:
 # If the registry we want to push to doesn't not support manifests don't push the ARCH image.
-	$(DOCKER) push $(call filter-registry,$(REGISTRY))$(BUILD_IMAGE):$(IMAGETAG)-$*
+	$(DOCKER) push --quiet $(call filter-registry,$(REGISTRY))$(BUILD_IMAGE):$(IMAGETAG)-$*
 	$(if $(filter $*,amd64),\
 		$(DOCKER) push $(REGISTRY)/$(BUILD_IMAGE):$(IMAGETAG),\
 		$(NOECHO) $(NOOP)\
 	)
 
-manifest-tool-generate-spec: var-require-all-BUILD_IMAGE-IMAGETAG-MANIFEST_TOOL_SPEC_TEMPLATE-OUTPUT_FILE
-	bash $(MANIFEST_TOOL_SPEC_TEMPLATE) $(OUTPUT_FILE) $(BUILD_IMAGE) $(IMAGETAG)
-
-## push multi-arch manifest where supported. If the MANIFEST_TOOL_SPEC_TEMPLATE variable is specified this will include
-## the `from-spec` version of the tool.
+# push multi-arch manifest where supported.
 push-manifests: var-require-all-IMAGETAG  $(addprefix sub-manifest-,$(call escapefs,$(PUSH_MANIFEST_IMAGES)))
-ifdef MANIFEST_TOOL_SPEC_TEMPLATE
-sub-manifest-%: var-require-all-OUTPUT_DIR
-	$(MAKE) manifest-tool-generate-spec BUILD_IMAGE=$(call unescapefs,$*) OUTPUT_FILE=$(OUTPUT_DIR)$*.yaml
-	$(MANIFEST_TOOL) push from-spec $(OUTPUT_DIR)$*.yaml$(double_quote)
-else
 sub-manifest-%:
-	$(MANIFEST_TOOL) push from-args --platforms $(call join_platforms,$(VALIDARCHES)) --template $(call unescapefs,$*):$(IMAGETAG)-ARCHVARIANT --target $(call unescapefs,$*):$(IMAGETAG)$(double_quote)
-endif
+	$(DOCKER) manifest create $(call unescapefs,$*):$(IMAGETAG) $(addprefix --amend ,$(addprefix $(call unescapefs,$*):$(IMAGETAG)-,$(VALIDARCHES)))
+	$(DOCKER) manifest push --purge $(call unescapefs,$*):$(IMAGETAG)
+
+push-manifests-with-tag: var-require-one-of-CONFIRM-DRYRUN var-require-all-BRANCH_NAME
+	$(MAKE) push-manifests IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(BRANCH_NAME) EXCLUDEARCH="$(EXCLUDEARCH)"
+	$(MAKE) push-manifests IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(GIT_VERSION) EXCLUDEARCH="$(EXCLUDEARCH)"
 
 # cd-common tags and pushes images with the branch name and git version. This target uses PUSH_IMAGES, BUILD_IMAGE,
 # and BRANCH_NAME env variables to figure out what to tag and where to push it to.
 cd-common: var-require-one-of-CONFIRM-DRYRUN var-require-all-BRANCH_NAME
-	$(MAKE) retag-build-images-with-registries push-images-to-registries push-manifests IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(BRANCH_NAME) EXCLUDEARCH="$(EXCLUDEARCH)"
-	$(MAKE) retag-build-images-with-registries push-images-to-registries push-manifests IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(shell git describe --tags --dirty --long --always --abbrev=12) EXCLUDEARCH="$(EXCLUDEARCH)"
+	$(MAKE) retag-build-images-with-registries push-images-to-registries IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(BRANCH_NAME) EXCLUDEARCH="$(EXCLUDEARCH)"
+	$(MAKE) retag-build-images-with-registries push-images-to-registries IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(shell git describe --tags --dirty --long --always --abbrev=12) EXCLUDEARCH="$(EXCLUDEARCH)"
 
 ###############################################################################
 # Release targets and helpers
@@ -975,7 +937,7 @@ cd-common: var-require-one-of-CONFIRM-DRYRUN var-require-all-BRANCH_NAME
 # - 'release' tag: A git tag of the form of `v3.8.0`. The commit that a release
 #   is cut from will have this tag, i.e. you can find the commit that release
 #   3.8 uses by finding the commit with the tag v3.8.0.
-# - 'dev' image: The image that is created for evey commit that is merged to
+# - 'dev' image: The image that is created for every commit that is merged to
 #   master or a release branch. This image is tagged with the dev tag, i.e.
 #   if commit 3a618e61c2d3 is on master or a release branch, there will be
 #   an image for that commit in the dev registry with the tag
@@ -1082,7 +1044,7 @@ ifdef EXPECTED_RELEASE_TAG
 		@echo "Failed to verify release tag$(comma) expected release version is $(EXPECTED_RELEASE_TAG)$(comma) actual is $(RELEASE_TAG)."\
 		&& exit 1)
 endif
-	$(eval NEXT_RELEASE_VERSION = $(shell echo "$(call git-release-tag-from-dev-tag)" | awk -F  "." '{print $$1"."$$2"."$$3+1}'))
+	$(eval NEXT_RELEASE_VERSION = $(shell echo "$(call git-release-tag-from-dev-tag)" | awk '{ split($0,tag,"-"); if (tag[2] ~ /^1\./) { split(tag[2],subver,"."); print tag[1]"-"subver[1]+1".0" } else { split(tag[1],ver,"."); print ver[1]"."ver[2]"."ver[3]+1 } }'))
 ifndef IMAGE_ONLY
 	$(MAKE) maybe-tag-release maybe-push-release-tag\
 		RELEASE_TAG=$(RELEASE_TAG) BRANCH=$(RELEASE_BRANCH) DEV_TAG=$(DEV_TAG)
@@ -1198,6 +1160,7 @@ release-dev-image-arch-to-registry-%:
 	$(CRANE) cp $(DEV_REGISTRY)/$(BUILD_IMAGE):$(DEV_TAG)-$* $(RELEASE_REGISTRY)/$(BUILD_IMAGE):$(RELEASE_TAG)-$*$(double_quote)
 
 # release-prereqs checks that the environment is configured properly to create a release.
+.PHONY: release-prereqs
 release-prereqs:
 ifndef VERSION
 	$(error VERSION is undefined - run using make release VERSION=vX.Y.Z)
@@ -1206,7 +1169,14 @@ endif
 # Check if the codebase is dirty or not.
 check-dirty:
 	@if [ "$$(git --no-pager diff --stat)" != "" ]; then \
-	echo "The following files are dirty"; git --no-pager diff --stat; exit 1; fi
+	echo "The following files are dirty"; git --no-pager diff; exit 1; fi
+
+bin/yq:
+	mkdir -p bin
+	$(eval TMP := $(shell mktemp -d))
+	curl -sSf -L --retry 5 -o $(TMP)/yq4.tar.gz https://github.com/mikefarah/yq/releases/download/v4.34.2/yq_linux_$(BUILDARCH).tar.gz
+	tar -zxvf $(TMP)/yq4.tar.gz -C $(TMP)
+	mv $(TMP)/yq_linux_$(BUILDARCH) bin/yq
 
 ###############################################################################
 # Common functions for launching a local Kubernetes control plane.
@@ -1299,7 +1269,7 @@ $(REPO_ROOT)/.$(KIND_NAME).created: $(KUBECTL) $(KIND)
 		--config $(KIND_CONFIG) \
 		--kubeconfig $(KIND_KUBECONFIG) \
 		--name $(KIND_NAME) \
-		--image kindest/node:$(K8S_VERSION)
+		--image kindest/node:$(KINDEST_NODE_VERSION)
 
 	# Wait for controller manager to be running and healthy, then create Calico CRDs.
 	while ! KUBECONFIG=$(KIND_KUBECONFIG) $(KUBECTL) get serviceaccount default; do echo "Waiting for default serviceaccount to be created..."; sleep 2; done
@@ -1312,21 +1282,55 @@ kind-cluster-destroy: $(KIND) $(KUBECTL)
 	rm -f $(KIND_KUBECONFIG)
 	rm -f $(REPO_ROOT)/.$(KIND_NAME).created
 
-kind $(KIND):
-	mkdir -p $(KIND_DIR)
-	$(DOCKER_GO_BUILD) sh -c "GOBIN=/go/src/github.com/projectcalico/calico/hack/test/kind go install sigs.k8s.io/kind@v0.14.0"
+$(KIND)-$(KIND_VERSION):
+	mkdir -p $(KIND_DIR)/$(KIND_VERSION)
+	$(DOCKER_GO_BUILD) sh -c "GOBIN=/go/src/github.com/projectcalico/calico/hack/test/kind/$(KIND_VERSION) go install sigs.k8s.io/kind@$(KIND_VERSION)"
+	mv $(KIND_DIR)/$(KIND_VERSION)/kind $(KIND_DIR)/kind-$(KIND_VERSION)
+	rm -r $(KIND_DIR)/$(KIND_VERSION)
 
-kubectl $(KUBECTL):
+$(KIND_DIR)/.kind-updated-$(KIND_VERSION): $(KIND)-$(KIND_VERSION)
+	rm -f $(KIND_DIR)/.kind-updated-*
+	cd $(KIND_DIR) && ln -fs kind-$(KIND_VERSION) kind
+	touch $@
+
+.PHONY: kind
+kind: $(KIND)
+	@echo "kind: $(KIND)"
+$(KIND): $(KIND_DIR)/.kind-updated-$(KIND_VERSION)
+
+$(KUBECTL)-$(K8S_VERSION):
 	mkdir -p $(KIND_DIR)
-	curl -L https://storage.googleapis.com/kubernetes-release/release/$(K8S_VERSION)/bin/linux/$(ARCH)/kubectl -o $@
+	curl -fsSL --retry 5 https://dl.k8s.io/release/$(K8S_VERSION)/bin/linux/$(ARCH)/kubectl -o $@
 	chmod +x $@
 
-bin/helm:
+$(KIND_DIR)/.kubectl-updated-$(K8S_VERSION): $(KUBECTL)-$(K8S_VERSION)
+	rm -f $(KIND_DIR)/.kubectl-updated-*
+	cd $(KIND_DIR) && ln -fs kubectl-$(K8S_VERSION) kubectl
+	touch $@
+
+.PHONY: kubectl
+kubectl: $(KUBECTL)
+	@echo "kubectl: $(KUBECTL)"
+$(KUBECTL): $(KIND_DIR)/.kubectl-updated-$(K8S_VERSION)
+
+bin/helm-$(HELM_VERSION):
 	mkdir -p bin
 	$(eval TMP := $(shell mktemp -d))
-	wget -q https://get.helm.sh/helm-v3.11.0-linux-amd64.tar.gz -O $(TMP)/helm3.tar.gz
+	curl -sSf -L --retry 5 -o $(TMP)/helm3.tar.gz https://get.helm.sh/helm-$(HELM_VERSION)-linux-$(ARCH).tar.gz
 	tar -zxvf $(TMP)/helm3.tar.gz -C $(TMP)
-	mv $(TMP)/linux-amd64/helm bin/helm
+	mv $(TMP)/linux-$(ARCH)/helm bin/helm-$(HELM_VERSION)
+
+bin/.helm-updated-$(HELM_VERSION): bin/helm-$(HELM_VERSION)
+	# Remove old marker files so that bin/helm will be stale if we switch
+	# branches and the helm version changes.
+	rm -f bin/.helm-updated-*
+	cd bin && ln -fs helm-$(HELM_VERSION) helm
+	touch $@
+
+.PHONY: helm
+helm: bin/helm
+	@echo "helm: $^"
+bin/helm: bin/.helm-updated-$(HELM_VERSION)
 
 ###############################################################################
 # Common functions for launching a local etcd instance.
@@ -1377,3 +1381,169 @@ help:
 	@echo "CALICO_BUILD:		$(CALICO_BUILD)"
 	@echo "-----------------------------------------------------------"
 
+###############################################################################
+# Common functions for building windows images.
+###############################################################################
+
+# When running on semaphore, just copy the docker config, otherwise run
+# 'docker-credential-gcr configure-docker' as well.
+ifdef SEMAPHORE
+DOCKER_CREDENTIAL_CMD = cp /root/.docker/config.json_host /root/.docker/config.json
+else
+DOCKER_CREDENTIAL_CMD = cp /root/.docker/config.json_host /root/.docker/config.json && \
+						docker-credential-gcr configure-docker
+endif
+
+# This needs the $(WINDOWS_DIST)/bin/docker-credential-gcr binary in $PATH and
+# also the local ~/.config/gcloud dir to be able to push to gcr.io.  It mounts
+# $(DOCKER_CONFIG) and copies it so that it can be written to on the container,
+# but not have any effect on the host config.
+CRANE_BINDMOUNT_CMD := \
+	docker run --rm \
+		--net=host \
+		--init \
+		--entrypoint /bin/sh \
+		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
+		-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
+		-v $(DOCKER_CONFIG):/root/.docker/config.json_host:ro \
+		-e PATH=$${PATH}:/go/src/$(PACKAGE_NAME)/$(WINDOWS_DIST)/bin \
+		-v $(HOME)/.config/gcloud:/root/.config/gcloud \
+		-w /go/src/$(PACKAGE_NAME) \
+		$(CALICO_BUILD) -c $(double_quote)$(DOCKER_CREDENTIAL_CMD) && crane
+
+DOCKER_MANIFEST_CMD := docker manifest
+
+ifdef CONFIRM
+CRANE_BINDMOUNT = $(CRANE_BINDMOUNT_CMD)
+DOCKER_MANIFEST = $(DOCKER_MANIFEST_CMD)
+else
+CRANE_BINDMOUNT = echo [DRY RUN] $(CRANE_BINDMOUNT_CMD)
+DOCKER_MANIFEST = echo [DRY RUN] $(DOCKER_MANIFEST_CMD)
+endif
+
+# Clean up the docker builder used to create Windows image tarballs.
+.PHONY: clean-windows-builder
+clean-windows-builder:
+	-docker buildx rm calico-windows-builder
+
+# Set up the docker builder used to create Windows image tarballs.
+.PHONY: setup-windows-builder
+setup-windows-builder: clean-windows-builder
+	docker buildx create --name=calico-windows-builder --use --platform windows/amd64
+
+# FIXME: Use WINDOWS_HPC_VERSION and image instead of nanoserver and WINDOWS_VERSIONS when containerd v1.6 is EOL'd
+# .PHONY: image-windows release-windows
+# NOTE: WINDOWS_IMAGE_REQS must be defined with the requirements to build the windows
+# image. These must be added as reqs to 'image-windows' (originally defined in
+# lib.Makefile) on the specific package Makefile otherwise they are not correctly
+# recognized.
+# # Build Windows image with tag and possibly push it to $DEV_REGISTRIES
+# image-windows-with-tag: var-require-all-WINDOWS_IMAGE-WINDOWS_DIST-WINDOWS_IMAGE_REQS-IMAGETAG
+# 	push="$${PUSH:-false}"; \
+# 	for registry in $(DEV_REGISTRIES); do \
+# 		echo Building and pushing Windows image to $${registry}; \
+# 		image="$${registry}/$(WINDOWS_IMAGE):$(IMAGETAG)"; \
+# 		docker buildx build \
+# 			--platform windows/amd64 \
+# 			--output=type=image,push=$${push} \
+# 			-t $${image} \
+# 			--pull \
+# 			--no-cache \
+# 			--build-arg GIT_VERSION=$(GIT_VERSION) \
+# 			--build-arg WINDOWS_HPC_VERSION=$(WINDOWS_HPC_VERSION) \
+# 			-f Dockerfile-windows .; \
+# 	done ;
+
+# image-windows: var-require-all-BRANCH_NAME
+# 	$(MAKE) image-windows-with-tag PUSH=$(PUSH) IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(BRANCH_NAME)
+# 	$(MAKE) image-windows-with-tag PUSH=$(PUSH) IMAGETAG=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(shell git describe --tags --dirty --long --always --abbrev=12)
+
+# # Build and push Windows image
+# release-windows: var-require-one-of-CONFIRM-DRYRUN release-prereqs clean-windows
+# 	$(MAKE) image-windows PUSH=true
+
+# Windows image pushing is different because we do not build docker images directly.
+# Since the build machine is linux, we output the images to a tarball. (We can
+# produce images but there will be no output because docker images
+# built for Windows cannot be loaded on linux.)
+#
+# The resulting image tarball is then pushed to registries during cd/release.
+# The image tarballs are located in WINDOWS_DIST and have files names
+# with the format 'node-windows-v3.21.0-2-abcdef-20H2.tar'.
+#
+# In addition to pushing the individual images, we also create the manifest
+# directly using 'docker manifest'. This is possible because Semaphore is using
+# a recent enough docker CLI version (20.10.0)
+#
+# - Create the manifest with 'docker manifest create' using the list of all images.
+# - For each windows version, 'docker manifest annotate' its image with "os.image: <windows_version>".
+#   <windows_version> is the version string that looks like, e.g. 10.0.19041.1288.
+#   Setting os.image in the manifest is required for Windows hosts to load the
+#   correct image in manifest.
+# - Finally we push the manifest, "purging" the local manifest.
+
+$(WINDOWS_DIST)/$(WINDOWS_IMAGE)-$(GIT_VERSION)-%.tar: windows-sub-image-$*
+
+DOCKER_CREDENTIAL_VERSION="2.1.18"
+DOCKER_CREDENTIAL_OS="linux"
+DOCKER_CREDENTIAL_ARCH="amd64"
+$(WINDOWS_DIST)/bin/docker-credential-gcr:
+	-mkdir -p $(WINDOWS_DIST)/bin
+	curl -fsSL  --retry 5 "https://github.com/GoogleCloudPlatform/docker-credential-gcr/releases/download/v$(DOCKER_CREDENTIAL_VERSION)/docker-credential-gcr_$(DOCKER_CREDENTIAL_OS)_$(DOCKER_CREDENTIAL_ARCH)-$(DOCKER_CREDENTIAL_VERSION).tar.gz" -o docker-credential-gcr.tar.gz
+	tar xzf docker-credential-gcr.tar.gz --to-stdout docker-credential-gcr | tee $@ > /dev/null && chmod +x $@
+	rm -f docker-credential-gcr.tar.gz
+
+.PHONY: docker-credential-gcr-binary
+docker-credential-gcr-binary: var-require-all-WINDOWS_DIST-DOCKER_CREDENTIAL_VERSION-DOCKER_CREDENTIAL_OS-DOCKER_CREDENTIAL_ARCH $(WINDOWS_DIST)/bin/docker-credential-gcr
+
+# NOTE: WINDOWS_IMAGE_REQS must be defined with the requirements to build the windows
+# image. These must be added as reqs to 'image-windows' (originally defined in
+# lib.Makefile) on the specific package Makefile otherwise they are not correctly
+# recognized.
+windows-sub-image-%: var-require-all-GIT_VERSION-WINDOWS_IMAGE-WINDOWS_DIST-WINDOWS_IMAGE_REQS
+	# ensure dir for windows image tars exits
+	-mkdir -p $(WINDOWS_DIST)
+	docker buildx build \
+		--platform windows/amd64 \
+		--output=type=docker,dest=$(CURDIR)/$(WINDOWS_DIST)/$(WINDOWS_IMAGE)-$(GIT_VERSION)-$*.tar \
+		$(DOCKER_PULL) \
+		-t $(WINDOWS_IMAGE):latest \
+		--build-arg GIT_VERSION=$(GIT_VERSION) \
+		--build-arg=WINDOWS_VERSION=$* \
+		-f Dockerfile-windows .
+
+.PHONY: image-windows release-windows release-windows-with-tag
+image-windows: setup-windows-builder var-require-all-WINDOWS_VERSIONS
+	for version in $(WINDOWS_VERSIONS); do \
+		$(MAKE) windows-sub-image-$${version}; \
+	done;
+
+release-windows-with-tag: var-require-one-of-CONFIRM-DRYRUN var-require-all-IMAGETAG-DEV_REGISTRIES image-windows docker-credential-gcr-binary
+	for registry in $(DEV_REGISTRIES); do \
+		echo Pushing Windows images to $${registry}; \
+		all_images=""; \
+		manifest_image="$${registry}/$(WINDOWS_IMAGE):$(IMAGETAG)"; \
+		for win_ver in $(WINDOWS_VERSIONS); do \
+			image_tar="$(WINDOWS_DIST)/$(WINDOWS_IMAGE)-$(GIT_VERSION)-$${win_ver}.tar"; \
+			image="$${registry}/$(WINDOWS_IMAGE):$(IMAGETAG)-windows-$${win_ver}"; \
+			echo Pushing image $${image} ...; \
+			$(CRANE_BINDMOUNT) push $${image_tar} $${image}$(double_quote) & \
+			all_images="$${all_images} $${image}"; \
+		done; \
+		wait; \
+		$(DOCKER_MANIFEST) create --amend $${manifest_image} $${all_images}; \
+		for win_ver in $(WINDOWS_VERSIONS); do \
+			version=$$(docker manifest inspect mcr.microsoft.com/windows/nanoserver:$${win_ver} | grep "os.version" | head -n 1 | awk -F\" '{print $$4}'); \
+			image="$${registry}/$(WINDOWS_IMAGE):$(IMAGETAG)-windows-$${win_ver}"; \
+			$(DOCKER_MANIFEST) annotate --os windows --arch amd64 --os-version $${version} $${manifest_image} $${image}; \
+		done; \
+		$(DOCKER_MANIFEST) push --purge $${manifest_image}; \
+	done;
+
+release-windows: var-require-one-of-CONFIRM-DRYRUN var-require-all-DEV_REGISTRIES-WINDOWS_IMAGE var-require-one-of-VERSION-BRANCH_NAME
+	describe_tag=$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(shell git describe --tags --dirty --long --always --abbrev=12); \
+	release_tag=$(if $(VERSION),$(VERSION),$(if $(IMAGETAG_PREFIX),$(IMAGETAG_PREFIX)-)$(BRANCH_NAME)); \
+	$(MAKE) release-windows-with-tag IMAGETAG=$${describe_tag}; \
+	for registry in $(DEV_REGISTRIES); do \
+		$(CRANE_BINDMOUNT) cp $${registry}/$(WINDOWS_IMAGE):$${describe_tag} $${registry}/$(WINDOWS_IMAGE):$${release_tag}$(double_quote); \
+	done;

@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,11 +18,44 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/jitter"
 )
+
+var (
+	conntrackCounterSweeps = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "felix_bpf_conntrack_sweeps",
+		Help: "Number of contrack table sweeps made so far",
+	})
+	conntrackGaugeUsed = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_used",
+		Help: "Number of used entries visited during a conntrack table sweep",
+	})
+	conntrackGaugeCleaned = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_cleaned",
+		Help: "Number of entries cleaned during a conntrack table sweep",
+	})
+	conntrackCounterCleaned = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_cleaned_total",
+		Help: "Total number of entries cleaned during conntrack table sweeps, " +
+			"incremented for each clean individualy",
+	})
+	conntrackGaugeSweepDuration = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "felix_bpf_conntrack_sweep_duration",
+		Help: "Conntrack sweep execution time (ns)",
+	})
+)
+
+func init() {
+	prometheus.MustRegister(conntrackCounterSweeps)
+	prometheus.MustRegister(conntrackGaugeUsed)
+	prometheus.MustRegister(conntrackGaugeCleaned)
+	prometheus.MustRegister(conntrackCounterCleaned)
+	prometheus.MustRegister(conntrackGaugeSweepDuration)
+}
 
 // ScanVerdict represents the set of values returned by EntryScan
 type ScanVerdict int
@@ -39,14 +72,14 @@ const (
 
 // EntryGet is a function prototype provided to EntryScanner in case it needs to
 // evaluate other entries to make a verdict
-type EntryGet func(Key) (Value, error)
+type EntryGet func(KeyInterface) (ValueInterface, error)
 
 // EntryScanner is a function prototype to be called on every entry by the scanner
 type EntryScanner interface {
-	Check(Key, Value, EntryGet) ScanVerdict
+	Check(KeyInterface, ValueInterface, EntryGet) ScanVerdict
 }
 
-// EntryScannerSynced is a scaner synchronized with the iteration start/end.
+// EntryScannerSynced is a scanner synchronized with the iteration start/end.
 type EntryScannerSynced interface {
 	EntryScanner
 	IterationStart()
@@ -61,8 +94,10 @@ type EntryScannerSynced interface {
 // It provides a delete-save iteration over the conntrack table for multiple
 // evaluation functions, to keep their implementation simpler.
 type Scanner struct {
-	ctMap    maps.Map
-	scanners []EntryScanner
+	ctMap          maps.Map
+	keyFromBytes   func([]byte) KeyInterface
+	valueFromBytes func([]byte) ValueInterface
+	scanners       []EntryScanner
 
 	wg       sync.WaitGroup
 	stopCh   chan struct{}
@@ -71,11 +106,15 @@ type Scanner struct {
 
 // NewScanner returns a scanner for the given conntrack map and the set of
 // EntryScanner. They are executed in the provided order on each entry.
-func NewScanner(ctMap maps.Map, scanners ...EntryScanner) *Scanner {
+func NewScanner(ctMap maps.Map, kfb func([]byte) KeyInterface, vfb func([]byte) ValueInterface,
+	scanners ...EntryScanner) *Scanner {
+
 	return &Scanner{
-		ctMap:    ctMap,
-		scanners: scanners,
-		stopCh:   make(chan struct{}),
+		ctMap:          ctMap,
+		keyFromBytes:   kfb,
+		valueFromBytes: vfb,
+		scanners:       scanners,
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -84,14 +123,20 @@ func (s *Scanner) Scan() {
 	s.iterStart()
 	defer s.iterEnd()
 
+	start := time.Now()
+
 	debug := log.GetLevel() >= log.DebugLevel
 
-	var ctKey Key
-	var ctVal Value
+	used := 0
+	cleaned := 0
 
+	log.Debug("Starting conntrack scanner iteration")
 	err := s.ctMap.Iter(func(k, v []byte) maps.IteratorAction {
-		copy(ctKey[:], k[:])
-		copy(ctVal[:], v[:])
+		ctKey := s.keyFromBytes(k)
+		ctVal := s.valueFromBytes(v)
+
+		used++
+		conntrackCounterCleaned.Inc()
 
 		if debug {
 			log.WithFields(log.Fields{
@@ -105,25 +150,31 @@ func (s *Scanner) Scan() {
 				if debug {
 					log.Debug("Deleting conntrack entry.")
 				}
+				cleaned++
 				return maps.IterDelete
 			}
 		}
 		return maps.IterNone
 	})
 
+	conntrackCounterSweeps.Inc()
+	conntrackGaugeUsed.Set(float64(used))
+	conntrackGaugeCleaned.Set(float64(cleaned))
+	conntrackGaugeSweepDuration.Set(float64(time.Since(start)))
+
 	if err != nil {
 		log.WithError(err).Warn("Failed to iterate over conntrack map")
 	}
 }
 
-func (s *Scanner) get(k Key) (Value, error) {
+func (s *Scanner) get(k KeyInterface) (ValueInterface, error) {
 	v, err := s.ctMap.Get(k.AsBytes())
 
 	if err != nil {
-		return Value{}, err
+		return nil, err
 	}
 
-	return ValueFromBytes(v), nil
+	return s.valueFromBytes(v), nil
 }
 
 // Start the periodic scanner
@@ -152,6 +203,7 @@ func (s *Scanner) Start() {
 }
 
 func (s *Scanner) iterStart() {
+	log.Debug("Calling IterationStart on all scanners")
 	for _, scanner := range s.scanners {
 		if synced, ok := scanner.(EntryScannerSynced); ok {
 			synced.IterationStart()
@@ -160,6 +212,7 @@ func (s *Scanner) iterStart() {
 }
 
 func (s *Scanner) iterEnd() {
+	log.Debug("Calling IterationEnd on all scanners")
 	for i := len(s.scanners) - 1; i >= 0; i-- {
 		scanner := s.scanners[i]
 		if synced, ok := scanner.(EntryScannerSynced); ok {
@@ -179,4 +232,10 @@ func (s *Scanner) Stop() {
 // AddUnlocked adds an additional EntryScanner to a non-running Scanner
 func (s *Scanner) AddUnlocked(scanner EntryScanner) {
 	s.scanners = append(s.scanners, scanner)
+}
+
+// AddFirstUnlocked adds an additional EntryScanner to a non-running Scanner as
+// the first scanner to be called.
+func (s *Scanner) AddFirstUnlocked(scanner EntryScanner) {
+	s.scanners = append([]EntryScanner{scanner}, s.scanners...)
 }

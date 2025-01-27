@@ -20,9 +20,8 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -35,19 +34,20 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", testutils.DatastoreK8s, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name1 := "ippool-1"
 	name2 := "ippool-2"
+	automatic := apiv3.Automatic
 
 	spec1_v3 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		NATOutgoing:  true,
-		IPIPMode:     apiv3.IPIPModeCrossSubnet,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		NATOutgoing:    true,
+		IPIPMode:       apiv3.IPIPModeCrossSubnet,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	kvp1 := &model.KVPair{
 		Key: model.ResourceKey{
@@ -72,19 +72,21 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 					Enabled: true,
 					Mode:    encap.CrossSubnet,
 				},
-				BlockSize: 26,
+				BlockSize:      26,
+				AssignmentMode: &automatic,
 			},
 		},
 	}
 
 	spec2_v3 := apiv3.IPPoolSpec{
-		CIDR:         "2001::/120",
-		NATOutgoing:  true,
-		IPIPMode:     apiv3.IPIPModeNever,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    122,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "2001::/120",
+		NATOutgoing:    true,
+		IPIPMode:       apiv3.IPIPModeNever,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      122,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	kvp2 := &model.KVPair{
 		Key: model.ResourceKey{
@@ -109,18 +111,20 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 				IPIP: &apiv3.IPIPConfiguration{
 					Enabled: false,
 				},
+				AssignmentMode: &automatic,
 			},
 		},
 	}
 
 	spec3_v3 := apiv3.IPPoolSpec{
-		CIDR:         "1.1.1.0/24",
-		NATOutgoing:  false,
-		IPIPMode:     apiv3.IPIPModeAlways,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.1.1.0/24",
+		NATOutgoing:    false,
+		IPIPMode:       apiv3.IPIPModeAlways,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	kvp3 := &model.KVPair{
 		Key: model.ResourceKey{
@@ -142,20 +146,22 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 				IPIP: &apiv3.IPIPConfiguration{
 					Enabled: true,
 				},
-				BlockSize:    26,
-				NodeSelector: "all()",
+				BlockSize:      26,
+				NodeSelector:   "all()",
+				AssignmentMode: &automatic,
 			},
 		},
 	}
 
 	spec5_v3 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		NATOutgoing:  true,
-		IPIPMode:     apiv3.IPIPModeAlways,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		NATOutgoing:    true,
+		IPIPMode:       apiv3.IPIPModeAlways,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	kvp5 := &model.KVPair{
 		Key: model.ResourceKey{
@@ -178,22 +184,24 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 					Enabled: true,
 					Mode:    encap.Always,
 				},
-				NATOutgoing:   true,
-				NATOutgoingV1: false,
-				BlockSize:     26,
-				NodeSelector:  "all()",
+				NATOutgoing:    true,
+				NATOutgoingV1:  false,
+				BlockSize:      26,
+				NodeSelector:   "all()",
+				AssignmentMode: &automatic,
 			},
 		},
 	}
 
 	spec6_v3 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		NATOutgoing:  true,
-		IPIPMode:     apiv3.IPIPModeCrossSubnet,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "has(x)",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		NATOutgoing:    true,
+		IPIPMode:       apiv3.IPIPModeCrossSubnet,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "has(x)",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	kvp6 := &model.KVPair{
 		Key: model.ResourceKey{
@@ -209,15 +217,16 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 				Name: name1,
 			},
 			Spec: apiv3.IPPoolSpec{
-				CIDR:          "1.2.3.0/24",
-				Disabled:      false,
-				VXLANMode:     apiv3.VXLANModeNever,
-				IPIPMode:      apiv3.IPIPModeCrossSubnet,
-				IPIP:          nil,
-				NATOutgoing:   false,
-				NATOutgoingV1: true,
-				BlockSize:     26,
-				NodeSelector:  "has(x)",
+				CIDR:           "1.2.3.0/24",
+				Disabled:       false,
+				VXLANMode:      apiv3.VXLANModeNever,
+				IPIPMode:       apiv3.IPIPModeCrossSubnet,
+				IPIP:           nil,
+				NATOutgoing:    false,
+				NATOutgoingV1:  true,
+				BlockSize:      26,
+				NodeSelector:   "has(x)",
+				AssignmentMode: &automatic,
 			},
 		},
 	}
@@ -254,7 +263,8 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 
 			By("Updating the IPPool from the API client with the non-writable v1 IPIP field")
 			_, outError = c.IPPools().Update(ctx, &apiv3.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "555", CreationTimestamp: metav1.Now(), UID: "a-rabbit-ate-my-carrot"},
+				// R.I.P: 'a-rabbit-ate-my-carrot' is no longer a valid UID according to Calico.
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "555", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       kvp.Value.(*apiv3.IPPool).Spec,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -381,8 +391,6 @@ var _ = testutils.E2eDatastoreDescribe("IPPool KDD v1 to v3 migration tests", te
 				},
 			})
 			testWatcher2.Stop()
-
 		})
 	})
-
 })

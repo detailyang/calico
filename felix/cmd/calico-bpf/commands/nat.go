@@ -15,12 +15,12 @@
 package commands
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
 	"github.com/docopt/docopt-go"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -96,25 +96,44 @@ func dumpAff(cmd *cobra.Command) (err error) {
 }
 
 func dump(cmd *cobra.Command) error {
-	natMap, err := nat.LoadFrontendMap(nat.FrontendMap())
-	if err != nil {
-		return err
-	}
+	if ipv6 != nil && *ipv6 {
+		natMap, err := nat.LoadFrontendMapV6(nat.FrontendMapV6())
+		if err != nil {
+			return err
+		}
 
-	back, err := nat.LoadBackendMap(nat.BackendMap())
-	if err != nil {
-		return err
-	}
+		back, err := nat.LoadBackendMapV6(nat.BackendMapV6())
+		if err != nil {
+			return err
+		}
 
-	dumpNice(cmd.Printf, natMap, back)
+		dumpNice[nat.FrontendKeyV6, nat.BackendValueV6](cmd.Printf, natMap, back)
+	} else {
+		natMap, err := nat.LoadFrontendMap(nat.FrontendMap())
+		if err != nil {
+			return err
+		}
+
+		back, err := nat.LoadBackendMap(nat.BackendMap())
+		if err != nil {
+			return err
+		}
+
+		dumpNice[nat.FrontendKey, nat.BackendValue](cmd.Printf, natMap, back)
+	}
 	return nil
 }
 
 type printfFn func(format string, i ...interface{})
 
-func dumpNice(printf printfFn, natMap nat.MapMem, back nat.BackendMapMem) {
+func dumpNice[FK nat.FrontendKeyComparable, BV nat.BackendValueInterface](printf printfFn,
+	natMap map[FK]nat.FrontendValue, back map[nat.BackendKey]BV) {
 	for nk, nv := range natMap {
-		count := nv.Count()
+		valCount := nv.Count()
+		count := int(valCount)
+		if valCount == nat.BlackHoleCount {
+			count = -1
+		}
 		local := nv.LocalCount()
 		id := nv.ID()
 		flags := nv.FlagsAsString()
@@ -123,14 +142,19 @@ func dumpNice(printf printfFn, natMap nat.MapMem, back nat.BackendMapMem) {
 		}
 		printf("%s port %d proto %d id %d count %d local %d%s\n",
 			nk.Addr(), nk.Port(), nk.Proto(), id, count, local, flags)
-		for i := uint32(0); i < count; i++ {
+		for i := 0; i < count; i++ {
 			bk := nat.NewNATBackendKey(id, uint32(i))
 			bv, ok := back[bk]
 			printf("\t%d:%d\t ", id, i)
 			if !ok {
 				printf("is missing\n")
 			} else {
-				printf("%s:%d\n", bv.Addr(), bv.Port())
+				fmtStr := "%s:%d\n"
+				// Use "[]" with IPv6 addresses
+				if bv.Addr().To4() == nil {
+					fmtStr = "[%s]:%d\n"
+				}
+				printf(fmtStr, bv.Addr(), bv.Port())
 			}
 		}
 	}
@@ -173,17 +197,17 @@ func (cmd *natFrontend) checkArgsCommon() error {
 	case "tcp":
 		cmd.proto = 6
 	default:
-		return errors.Errorf("unknown protocol %s", proto)
+		return fmt.Errorf("unknown protocol %s", proto)
 	}
 
 	cmd.ip = net.ParseIP(cmd.IP)
 	if cmd.ip == nil {
-		return errors.Errorf("ip: %q is not an ip", cmd.IP)
+		return fmt.Errorf("ip: %q is not an ip", cmd.IP)
 	}
 
 	port, err := strconv.ParseUint(cmd.Port, 0, 16)
 	if err != nil {
-		return errors.Errorf("port: %q is not 16-bit uint", cmd.Port)
+		return fmt.Errorf("port: %q is not 16-bit uint", cmd.Port)
 	}
 	cmd.port = uint16(port)
 
@@ -195,12 +219,12 @@ func (cmd *natFrontend) ArgsSet(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	if err := cmd.checkArgsCommon(); err != nil {
@@ -209,13 +233,13 @@ func (cmd *natFrontend) ArgsSet(c *cobra.Command, args []string) error {
 
 	id, err := strconv.ParseUint(cmd.ID, 0, 32)
 	if err != nil {
-		return errors.Errorf("id: %q is not 32-bit uint", cmd.ID)
+		return fmt.Errorf("id: %q is not 32-bit uint", cmd.ID)
 	}
 	cmd.id = uint32(id)
 
 	count, err := strconv.ParseUint(cmd.Count, 0, 16)
 	if err != nil {
-		return errors.Errorf("count: %q is not 32-bit uint", cmd.Count)
+		return fmt.Errorf("count: %q is not 32-bit uint", cmd.Count)
 	}
 	cmd.count = uint32(count)
 
@@ -257,12 +281,12 @@ func (cmd *natFrontend) ArgsDel(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	return cmd.checkArgsCommon()
@@ -313,13 +337,13 @@ func newNatSetBackend() *cobra.Command {
 func (cmd *natBackend) checkArgsCommon() error {
 	id, err := strconv.ParseUint(cmd.ID, 0, 32)
 	if err != nil {
-		return errors.Errorf("id: %q is not 32-bit uint", cmd.ID)
+		return fmt.Errorf("id: %q is not 32-bit uint", cmd.ID)
 	}
 	cmd.id = uint32(id)
 
 	idx, err := strconv.ParseUint(cmd.Idx, 0, 32)
 	if err != nil {
-		return errors.Errorf("idx: %q is not 32-bit uint", cmd.Idx)
+		return fmt.Errorf("idx: %q is not 32-bit uint", cmd.Idx)
 	}
 	cmd.idx = uint32(idx)
 
@@ -331,22 +355,22 @@ func (cmd *natBackend) ArgsSet(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	cmd.ip = net.ParseIP(cmd.IP)
 	if cmd.ip == nil {
-		return errors.Errorf("ip: %q is not an ip", cmd.IP)
+		return fmt.Errorf("ip: %q is not an ip", cmd.IP)
 	}
 
 	port, err := strconv.ParseUint(cmd.Port, 0, 16)
 	if err != nil {
-		return errors.Errorf("port: %q is not 16-bit uint", cmd.Port)
+		return fmt.Errorf("port: %q is not 16-bit uint", cmd.Port)
 	}
 	cmd.port = uint16(port)
 
@@ -388,12 +412,12 @@ func (cmd *natBackend) ArgsDel(c *cobra.Command, args []string) error {
 
 	a, err := docopt.ParseArgs(makeDocUsage(c), args, "")
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	err = a.Bind(cmd)
 	if err != nil {
-		return errors.New(err.Error())
+		return err
 	}
 
 	return cmd.checkArgsCommon()

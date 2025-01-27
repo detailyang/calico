@@ -19,10 +19,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/file"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/file"
 )
 
 // Check handling of file or directory enumeration
@@ -167,7 +167,7 @@ var _ = Describe("File and directory iteration", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	It("should handle non-existent file", func() {
+	It("should handle nonexistent file", func() {
 		err := runTest("this-file-should-not-exist", false, []string{"this-file-should-not-exist"})
 		Expect(err).NotTo(HaveOccurred())
 	})

@@ -21,11 +21,10 @@ import (
 	"unsafe"
 
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/asm"
 	"github.com/projectcalico/calico/felix/bpf/bpfutils"
-
-	"golang.org/x/sys/unix"
 )
 
 // #include "bpf_syscall.h"
@@ -39,7 +38,7 @@ const defaultLogSize = 1024 * 1024
 const maxLogSize = 128 * 1024 * 1024
 
 func LoadBPFProgramFromInsns(insns asm.Insns, name, license string, progType uint32) (fd ProgFD, err error) {
-	log.Debugf("LoadBPFProgramFromInsns(%v, %v, %v)", insns, license, progType)
+	log.Debugf("LoadBPFProgramFromInsns(%v, %q, %v, %v)", insns, name, license, progType)
 	bpfutils.IncreaseLockedMemoryQuota()
 
 	// Occasionally see retryable errors here, retry silently a few times before going into log-collection mode.
@@ -81,7 +80,7 @@ func LoadBPFProgramFromInsns(insns asm.Insns, name, license string, progType uin
 }
 
 func tryLoadBPFProgramFromInsns(insns asm.Insns, name, license string, logSize uint, progType uint32) (ProgFD, error) {
-	log.Debugf("tryLoadBPFProgramFromInsns(..., %v, %v, %v)", license, logSize, progType)
+	log.Debugf("tryLoadBPFProgramFromInsns(..., %s, %v, %v, %v)", name, license, logSize, progType)
 	bpfAttr := C.bpf_attr_alloc()
 	defer C.free(unsafe.Pointer(bpfAttr))
 
@@ -152,7 +151,7 @@ func RunBPFProgram(fd ProgFD, dataIn []byte, repeat int) (pr ProgResult, err err
 
 	pr.RC = int32(C.bpf_attr_prog_run_retval(bpfAttr))
 	dataOutSize := C.bpf_attr_prog_run_data_out_size(bpfAttr)
-	pr.Duration = time.Duration(C.bpf_attr_prog_run_data_out_size(bpfAttr))
+	pr.Duration = time.Duration(C.bpf_attr_prog_run_duration(bpfAttr))
 	pr.DataOut = C.GoBytes(cDataOut, C.int(dataOutSize))
 	return
 }

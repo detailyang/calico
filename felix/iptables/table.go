@@ -30,11 +30,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
 	"github.com/projectcalico/calico/felix/environment"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/iptables/cmdshim"
 	"github.com/projectcalico/calico/felix/logutils"
+	logutilslc "github.com/projectcalico/calico/libcalico-go/lib/logutils"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 const (
@@ -109,7 +110,7 @@ func init() {
 //
 // Table supports two classes of operation:  "rule insertions" and "full chain updates".
 //
-// As the name suggests, rule insertions allow for inserting one or more rules into a pre-existing
+// As the name suggests, rule insertions allow for inserting one or more rules into a preexisting
 // chain.  Rule insertions are intended to be used to hook kernel chains (such as "FORWARD") in
 // order to direct them to a Felix-owned chain.  It is important to minimise the use of rule
 // insertions because the top-level chains are shared resources, which can be modified by other
@@ -124,7 +125,7 @@ func init() {
 //
 // In either case, the actual dataplane updates are deferred until the next call to Apply() so
 // chain updates and insertions may occur in any order as long as they are consistent (i.e. there
-// are no references to non-existent chains) by the time Apply() is called.
+// are no references to nonexistent chains) by the time Apply() is called.
 //
 // # Design
 //
@@ -187,8 +188,10 @@ func init() {
 // thread.  To avoid conflicts in the dataplane itself, there should only be one instance of
 // Table for each iptable table in an application.
 type Table struct {
-	Name      string
-	IPVersion uint8
+	name      string
+	ipVersion uint8
+
+	render IptablesRenderer
 
 	// featureDetector detects the features of the dataplane.
 	featureDetector environment.FeatureDetectorIface
@@ -196,17 +199,17 @@ type Table struct {
 	// chainToInsertedRules maps from chain name to a list of rules to be inserted at the start
 	// of that chain.  Rules are written with rule hash comments.  The Table cleans up inserted
 	// rules with unknown hashes.
-	chainToInsertedRules map[string][]Rule
+	chainToInsertedRules map[string][]generictables.Rule
 	// chainToAppendRules maps from chain name to a list of rules to be appended at the end
 	// of that chain.
-	chainToAppendedRules map[string][]Rule
+	chainToAppendedRules map[string][]generictables.Rule
 	dirtyInsertAppend    set.Set[string]
 
 	// chainToRuleFragments contains the desired state of our iptables chains, indexed by
 	// chain name.  The values are slices of iptables fragments, such as
 	// "--match foo --jump DROP" (i.e. omitting the action and chain name, which are calculated
 	// as needed).
-	chainNameToChain map[string]*Chain
+	chainNameToChain map[string]*generictables.Chain
 	// chainRefCounts counts the number of chains that refer to a given chain.  Transitive
 	// reachability isn't tracked but testing whether a chain is referenced does allow us to
 	// avoid programming unreferenced leaf chains (for example, policies that aren't used in
@@ -252,6 +255,12 @@ type Table struct {
 	postWriteInterval        time.Duration
 	refreshInterval          time.Duration
 
+	// Estimates for the time taken to do an iptables save and restore.
+	// When a save/restore exceeds the one of these we update them immediately.
+	// When a save/restore takes less time we decay them exponentially.
+	peakIptablesSaveTime    time.Duration
+	peakIptablesRestoreTime time.Duration
+
 	// calicoXtablesLock, if enabled, our implementation of the xtables lock.
 	calicoXtablesLock sync.Locker
 
@@ -261,11 +270,13 @@ type Table struct {
 	// implementation.
 	lockProbeInterval time.Duration
 
-	logCxt *log.Entry
+	logCxt               *log.Entry
+	updateRateLimitedLog *logutilslc.RateLimitedLogger
 
 	gaugeNumChains        prometheus.Gauge
 	gaugeNumRules         prometheus.Gauge
 	countNumLinesExecuted prometheus.Counter
+	unexpectedInsertsSeen int
 
 	// Reusable buffer for writing to iptables.
 	restoreInputBuffer RestoreInputBuilder
@@ -280,6 +291,7 @@ type Table struct {
 
 	onStillAlive func()
 	opReporter   logutils.OpRecorder
+	reason       string
 }
 
 type TableOptions struct {
@@ -338,13 +350,13 @@ func NewTable(
 
 	// Pre-populate the insert and append table with empty lists for each kernel chain.  Ensures that we
 	// clean up any chains that we hooked on a previous run.
-	inserts := map[string][]Rule{}
-	appends := map[string][]Rule{}
+	inserts := map[string][]generictables.Rule{}
+	appends := map[string][]generictables.Rule{}
 	dirtyInsertAppend := set.New[string]()
 	refcounts := map[string]int{}
 	for _, kernelChain := range tableToKernelChains[name] {
-		inserts[kernelChain] = []Rule{}
-		appends[kernelChain] = []Rule{}
+		inserts[kernelChain] = []generictables.Rule{}
+		appends[kernelChain] = []generictables.Rule{}
 		dirtyInsertAppend.Add(kernelChain)
 		// Kernel chains are referred to by definition.
 		refcounts[kernelChain] += 1
@@ -386,22 +398,28 @@ func NewTable(
 		lookPath = options.LookPathOverride
 	}
 
+	logFields := log.Fields{
+		"ipVersion": ipVersion,
+		"table":     name,
+	}
 	table := &Table{
-		Name:                   name,
-		IPVersion:              ipVersion,
+		name:                   name,
+		ipVersion:              ipVersion,
+		render:                 NewIptablesRenderer(hashPrefix),
 		featureDetector:        featureDetector,
 		chainToInsertedRules:   inserts,
 		chainToAppendedRules:   appends,
 		dirtyInsertAppend:      dirtyInsertAppend,
-		chainNameToChain:       map[string]*Chain{},
+		chainNameToChain:       map[string]*generictables.Chain{},
 		chainRefCounts:         refcounts,
 		dirtyChains:            set.New[string](),
 		chainToDataplaneHashes: map[string][]string{},
 		chainToFullRules:       map[string][]string{},
-		logCxt: log.WithFields(log.Fields{
-			"ipVersion": ipVersion,
-			"table":     name,
-		}),
+		logCxt:                 log.WithFields(logFields),
+		updateRateLimitedLog: logutilslc.NewRateLimitedLogger(
+			logutilslc.OptInterval(30*time.Second),
+			logutilslc.OptBurst(100),
+		).WithFields(logFields),
 		hashCommentPrefix: hashPrefix,
 		hashCommentRegexp: hashCommentRegexp,
 		ourChainsRegexp:   ourChainsRegexp,
@@ -456,106 +474,130 @@ func NewTable(
 	return table
 }
 
-// Insert or Append rules based on insert mode configuration.
-func (t *Table) InsertOrAppendRules(chainName string, rules []Rule) {
+func (t *Table) IPVersion() uint8 {
+	return t.ipVersion
+}
+
+func (t *Table) Name() string {
+	return t.name
+}
+
+// InsertOrAppendRules sets the rules that should be inserted into or appended
+// to the given non-Calico chain (depending on the chain insert mode).  See
+// also AppendRules, which can be used to record additional rules that are
+// always appended.
+func (t *Table) InsertOrAppendRules(chainName string, rules []generictables.Rule) {
 	t.logCxt.WithField("chainName", chainName).Debug("Updating rule insertions")
 	oldRules := t.chainToInsertedRules[chainName]
 	t.chainToInsertedRules[chainName] = rules
 	numRulesDelta := len(rules) - len(oldRules)
 	t.gaugeNumRules.Add(float64(numRulesDelta))
+	t.logCxt.WithField("numRulesDelta", numRulesDelta).Debug("Added to gauge")
 	t.dirtyInsertAppend.Add(chainName)
 
 	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
 	// avoid marking a still-referenced chain as dirty.
-	t.increfReferredChains(rules)
-	t.decrefReferredChains(oldRules)
+	t.maybeIncrefReferredChains(chainName, rules)
+	t.maybeDecrefReferredChains(chainName, oldRules)
 
-	// Defensive: make sure we re-read the dataplane state before we make updates.  While the
-	// code was originally designed not to need this, we found that other users of
-	// iptables-restore can still clobber our updates so it's safest to re-read the state before
-	// each write.
+	// Defensive: updates to insert/append is very rare and the top-level
+	// chains are contended with other apps.  Make sure we re-read the state
+	// of the chains before updating them.
 	t.InvalidateDataplaneCache("insertion")
 }
 
-// Append rules.
-func (t *Table) AppendRules(chainName string, rules []Rule) {
+// AppendRules sets the rules to be appended to a given non-Calico chain.
+// These rules are always appended, even if chain insert mode is "insert".
+// If chain insert mode is "append", these rules are appended after any
+// rules added with InsertOrAppendRules.
+func (t *Table) AppendRules(chainName string, rules []generictables.Rule) {
 	t.logCxt.WithField("chainName", chainName).Debug("Updating rule appends")
 	oldRules := t.chainToAppendedRules[chainName]
 	t.chainToAppendedRules[chainName] = rules
 	numRulesDelta := len(rules) - len(oldRules)
 	t.gaugeNumRules.Add(float64(numRulesDelta))
+	t.logCxt.WithField("numRulesDelta", numRulesDelta).Debug("Added to gauge")
 	t.dirtyInsertAppend.Add(chainName)
 
 	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
 	// avoid marking a still-referenced chain as dirty.
-	t.increfReferredChains(rules)
-	t.decrefReferredChains(oldRules)
+	t.maybeIncrefReferredChains(chainName, rules)
+	t.maybeDecrefReferredChains(chainName, oldRules)
 
-	// Defensive: make sure we re-read the dataplane state before we make updates.  While the
-	// code was originally designed not to need this, we found that other users of
-	// iptables-restore can still clobber out updates so it's safest to re-read the state before
-	// each write.
+	// Defensive: updates to insert/append is very rare and the top-level
+	// chains are contended with other apps.  Make sure we re-read the state
+	// of the chains before updating them.
 	t.InvalidateDataplaneCache("insertion")
 }
 
-func (t *Table) UpdateChains(chains []*Chain) {
+func (t *Table) UpdateChains(chains []*generictables.Chain) {
 	for _, chain := range chains {
 		t.UpdateChain(chain)
 	}
 }
 
-func (t *Table) UpdateChain(chain *Chain) {
-	t.logCxt.WithField("chainName", chain.Name).Info("Queueing update of chain.")
+func (t *Table) UpdateChain(chain *generictables.Chain) {
+	t.logCxt.WithField("chainName", chain.Name).Debug("Adding chain to available set.")
 	oldNumRules := 0
 
 	// Incref any newly-referenced chains, then decref the old ones.  By incrementing first we
 	// avoid marking a still-referenced chain as dirty.
-	t.increfReferredChains(chain.Rules)
+	t.maybeIncrefReferredChains(chain.Name, chain.Rules)
 	if oldChain := t.chainNameToChain[chain.Name]; oldChain != nil {
 		oldNumRules = len(oldChain.Rules)
-		t.decrefReferredChains(oldChain.Rules)
+		t.maybeDecrefReferredChains(chain.Name, oldChain.Rules)
 	}
 	t.chainNameToChain[chain.Name] = chain
-	numRulesDelta := len(chain.Rules) - oldNumRules
-	t.gaugeNumRules.Add(float64(numRulesDelta))
-	if t.chainRefCounts[chain.Name] > 0 {
+	if t.chainIsReferenced(chain.Name) {
+		numRulesDelta := len(chain.Rules) - oldNumRules
+		t.gaugeNumRules.Add(float64(numRulesDelta))
+		t.logCxt.WithField("numRulesDelta", numRulesDelta).Debug("Added to gauge")
 		t.dirtyChains.Add(chain.Name)
-	}
 
-	// Defensive: make sure we re-read the dataplane state before we make updates.  While the
-	// code was originally designed not to need this, we found that other users of
-	// iptables-restore can still clobber our updates so it's safest to re-read the state before
-	// each write.
-	t.InvalidateDataplaneCache("chain update")
+		// Defensive: make sure we re-read the dataplane state before we make updates.  While the
+		// code was originally designed not to need this, we found that other users of
+		// iptables-restore can still clobber our updates so it's safest to re-read the state before
+		// each write.
+		t.InvalidateDataplaneCache("chain update")
+	}
 }
 
-func (t *Table) RemoveChains(chains []*Chain) {
+func (t *Table) RemoveChains(chains []*generictables.Chain) {
 	for _, chain := range chains {
 		t.RemoveChainByName(chain.Name)
 	}
 }
 
 func (t *Table) RemoveChainByName(name string) {
-	t.logCxt.WithField("chainName", name).Info("Queuing deletion of chain.")
+	t.logCxt.WithField("chainName", name).Debug("Removing chain from available set.")
 	if oldChain, known := t.chainNameToChain[name]; known {
-		t.gaugeNumRules.Sub(float64(len(oldChain.Rules)))
+		t.maybeDecrefReferredChains(name, oldChain.Rules)
 		delete(t.chainNameToChain, name)
-		if t.chainRefCounts[name] > 0 {
+		if t.chainIsReferenced(name) {
+			t.gaugeNumRules.Sub(float64(len(oldChain.Rules)))
+			t.logCxt.WithField("len_rules", len(oldChain.Rules)).Debug("Subtracted from gauge")
 			t.dirtyChains.Add(name)
-		}
-		t.decrefReferredChains(oldChain.Rules)
-	}
 
-	// Defensive: make sure we re-read the dataplane state before we make updates.  While the
-	// code was originally designed not to need this, we found that other users of
-	// iptables-restore can still clobber out updates so it's safest to re-read the state before
-	// each write.
-	t.InvalidateDataplaneCache("chain removal")
+			// Defensive: make sure we re-read the dataplane state before we make updates.  While the
+			// code was originally designed not to need this, we found that other users of
+			// iptables-restore can still clobber out updates so it's safest to re-read the state before
+			// each write.
+			t.InvalidateDataplaneCache("chain removal")
+		}
+	}
 }
 
-// increfReferredChains finds all the chains that the given rules refer to  (i.e. have jumps/gotos to) and
-// increments their refcount.
-func (t *Table) increfReferredChains(rules []Rule) {
+func (t *Table) chainIsReferenced(name string) bool {
+	return t.chainRefCounts[name] > 0
+}
+
+// maybeIncrefReferredChains checks whether the named chain is referenced;
+// if so, it increfs all child chains.  If a child chain becomes newly
+// referenced, its children are increffed recursively.
+func (t *Table) maybeIncrefReferredChains(chainName string, rules []generictables.Rule) {
+	if !t.chainIsReferenced(chainName) {
+		return
+	}
 	for _, r := range rules {
 		if ref, ok := r.Action.(Referrer); ok {
 			t.increfChain(ref.ReferencedChain())
@@ -563,9 +605,13 @@ func (t *Table) increfReferredChains(rules []Rule) {
 	}
 }
 
-// decrefReferredChains finds all the chains that the given rules refer to (i.e. have jumps/gotos to) and
-// decrements their refcount.
-func (t *Table) decrefReferredChains(rules []Rule) {
+// maybeDecrefReferredChains checks whether the named chain is referenced;
+// if so, it decrefs all child chains.  If a child chain becomes newly
+// unreferenced, its children are decreffed recursively.
+func (t *Table) maybeDecrefReferredChains(chainName string, rules []generictables.Rule) {
+	if !t.chainIsReferenced(chainName) {
+		return
+	}
 	for _, r := range rules {
 		if ref, ok := r.Action.(Referrer); ok {
 			t.decrefChain(ref.ReferencedChain())
@@ -579,8 +625,16 @@ func (t *Table) increfChain(chainName string) {
 	log.WithField("chainName", chainName).Debug("Incref chain")
 	t.chainRefCounts[chainName] += 1
 	if t.chainRefCounts[chainName] == 1 {
-		log.WithField("chainName", chainName).Info("Chain became referenced, marking it for programming")
+		t.updateRateLimitedLog.WithField("chainName", chainName).Info("Chain became referenced, marking it for programming")
 		t.dirtyChains.Add(chainName)
+		if chain := t.chainNameToChain[chainName]; chain != nil {
+			t.gaugeNumRules.Add(float64(len(t.chainNameToChain[chainName].Rules)))
+			t.logCxt.WithField("len_rules", len(t.chainNameToChain[chainName].Rules)).Debug("Added to gauge")
+			// Recursively incref chains that this chain refers to.  If
+			// chain == nil then the chain is likely about to be added, in
+			// which case we'll handle this whe the chain is added.
+			t.maybeIncrefReferredChains(chainName, chain.Rules)
+		}
 	}
 }
 
@@ -588,12 +642,24 @@ func (t *Table) increfChain(chainName string) {
 // marks the chain dirty so it will be cleaned up.
 func (t *Table) decrefChain(chainName string) {
 	log.WithField("chainName", chainName).Debug("Decref chain")
-	t.chainRefCounts[chainName] -= 1
-	if t.chainRefCounts[chainName] == 0 {
-		log.WithField("chainName", chainName).Info("Chain no longer referenced, marking it for removal")
+	if t.chainRefCounts[chainName] == 1 {
+		t.updateRateLimitedLog.WithField("chainName", chainName).Info("Chain no longer referenced, marking it for removal")
+
+		if chain := t.chainNameToChain[chainName]; chain != nil {
+			t.gaugeNumRules.Sub(float64(len(t.chainNameToChain[chainName].Rules)))
+			t.logCxt.WithField("len_rules", len(t.chainNameToChain[chainName].Rules)).Debug("Subtracted from gauge")
+			// Recursively decref chains that this chain refers to.  If
+			// chain == nil then the chain has probably already been deleted
+			// in which case we'll already have done the decrefs.
+			t.maybeDecrefReferredChains(chainName, chain.Rules)
+		}
 		delete(t.chainRefCounts, chainName)
 		t.dirtyChains.Add(chainName)
+		return
 	}
+
+	// Chain still referenced, just decrement.
+	t.chainRefCounts[chainName] -= 1
 }
 
 func (t *Table) loadDataplaneState() {
@@ -602,15 +668,18 @@ func (t *Table) loadDataplaneState() {
 
 	// Load the hashes from the dataplane.
 	t.logCxt.Debug("Loading current iptables state and checking it is correct.")
-	t.opReporter.RecordOperation(fmt.Sprintf("resync-%v-v%d", t.Name, t.IPVersion))
+	t.opReporter.RecordOperation(fmt.Sprintf("resync-%v-v%d", t.name, t.ipVersion))
 
 	t.lastReadTime = t.timeNow()
 	dataplaneHashes, dataplaneRules := t.getHashesAndRulesFromDataplane()
 
 	// Check that the rules we think we've programmed are still there and mark any inconsistent
 	// chains for refresh.
+	logCxt := t.logCxt.WithField("chainName", "")
 	for chainName, expectedHashes := range t.chainToDataplaneHashes {
-		logCxt := t.logCxt.WithField("chainName", chainName)
+		// Re-using one logrus.Entry to reduce allocations.
+		logCxt.Data["chainName"] = chainName
+
 		if t.dirtyChains.Contains(chainName) || t.dirtyInsertAppend.Contains(chainName) {
 			// Already an update pending for this chain; no point in flagging it as
 			// out-of-sync.
@@ -621,20 +690,22 @@ func (t *Table) loadDataplaneState() {
 		if !t.ourChainsRegexp.MatchString(chainName) {
 			// Not one of our chains so it may be one that we're inserting rules into.
 			insertedRules := t.chainToInsertedRules[chainName]
-			if len(insertedRules) == 0 {
-				// This chain shouldn't have any inserts, make sure that's the
-				// case.  This case also covers the case where a chain was removed,
-				// making dpHashes nil.
-				dataplaneHasInserts := false
+			appendedRules := t.chainToAppendedRules[chainName]
+			if len(insertedRules) == 0 && len(appendedRules) == 0 {
+				// This chain shouldn't have any inserted/appended rules, make
+				// sure that's the case.  This case also covers the case where
+				// a chain was removed, making dpHashes nil.
+				chainHasCalicoRules := false
 				for _, hash := range dpHashes {
 					if hash != "" {
-						dataplaneHasInserts = true
+						chainHasCalicoRules = true
 						break
 					}
 				}
-				if dataplaneHasInserts {
+				if chainHasCalicoRules {
 					logCxt.WithField("actualRuleIDs", dpHashes).Warn(
 						"Chain had unexpected inserts, marking for resync")
+					t.unexpectedInsertsSeen++
 					t.dirtyInsertAppend.Add(chainName)
 				}
 				continue
@@ -780,7 +851,18 @@ func (t *Table) getHashesAndRulesFromDataplane() (hashes map[string][]string, ru
 // attemptToGetHashesAndRulesFromDataplane starts an iptables-save subprocess and feeds its output to
 // readHashesAndRulesFrom() via a pipe.  It handles the various error cases.
 func (t *Table) attemptToGetHashesAndRulesFromDataplane() (hashes map[string][]string, rules map[string][]string, err error) {
-	cmd := t.newCmd(t.iptablesSaveCmd, "-t", t.Name)
+	startTime := t.timeNow()
+	defer func() {
+		saveDuration := t.timeNow().Sub(startTime)
+		t.peakIptablesSaveTime = t.peakIptablesSaveTime * 99 / 100
+		if saveDuration > t.peakIptablesSaveTime {
+			log.WithField("duration", saveDuration).Debug("Updating iptables-save peak duration.")
+			t.peakIptablesSaveTime = saveDuration
+		}
+	}()
+
+	t.logCxt.Debugf("Starting %s", t.iptablesSaveCmd)
+	cmd := t.newCmd(t.iptablesSaveCmd, "-t", t.name)
 	countNumSaveCalls.Inc()
 
 	stdout, err := cmd.StdoutPipe()
@@ -813,7 +895,11 @@ func (t *Table) attemptToGetHashesAndRulesFromDataplane() (hashes map[string][]s
 	}
 	waitErr := cmd.Wait()
 	if waitErr != nil {
-		log.WithError(waitErr).Warn("iptables save failed")
+		if log.IsLevelEnabled(log.DebugLevel) {
+			t.logCxt.WithFields(log.Fields{"cmd": t.iptablesSaveCmd}).Warn("iptables save failed")
+		} else {
+			log.WithError(waitErr).Warn("iptables save failed")
+		}
 		if err == nil {
 			err = waitErr
 		}
@@ -943,10 +1029,19 @@ func (t *Table) InvalidateDataplaneCache(reason string) {
 	}
 	logCxt.Debug("Invalidating dataplane cache")
 	t.inSyncWithDataPlane = false
+	t.reason = reason
 }
 
 func (t *Table) Apply() (rescheduleAfter time.Duration) {
 	now := t.timeNow()
+	defer func() {
+		if time.Since(now) > time.Second {
+			log.WithFields(log.Fields{
+				"applyTime":      time.Since(now),
+				"reasonForApply": t.reason,
+			}).Info("Updating iptables took >1s")
+		}
+	}()
 	// We _think_ we're in sync, check if there are any reasons to think we might
 	// not be in sync.
 	lastReadToNow := now.Sub(t.lastReadTime)
@@ -1004,7 +1099,7 @@ func (t *Table) Apply() (rescheduleAfter time.Duration) {
 				continue
 			} else {
 				t.logCxt.WithError(err).Error("Failed to program iptables, loading diags before panic.")
-				cmd := t.newCmd(t.iptablesSaveCmd, "-t", t.Name)
+				cmd := t.newCmd(t.iptablesSaveCmd, "-t", t.name)
 				output, err2 := cmd.Output()
 				if err2 != nil {
 					t.logCxt.WithError(err2).Error("Failed to load iptables state")
@@ -1029,11 +1124,11 @@ func (t *Table) Apply() (rescheduleAfter time.Duration) {
 		rescheduleAfter = t.refreshInterval - lastReadToNow
 	}
 	if t.postWriteInterval < time.Hour {
-		postWriteReched := t.lastWriteTime.Add(t.postWriteInterval).Sub(now)
-		if postWriteReched <= 0 {
+		postWriteReached := t.lastWriteTime.Add(t.postWriteInterval).Sub(now)
+		if postWriteReached <= 0 {
 			rescheduleAfter = 1 * time.Millisecond
-		} else if t.refreshInterval <= 0 || postWriteReched < rescheduleAfter {
-			rescheduleAfter = postWriteReched
+		} else if t.refreshInterval <= 0 || postWriteReached < rescheduleAfter {
+			rescheduleAfter = postWriteReached
 		}
 	}
 
@@ -1050,7 +1145,7 @@ func (t *Table) applyUpdates() error {
 	buf.Reset() // Defensive.
 
 	// iptables-restore commands live in per-table transactions.
-	buf.StartTransaction(t.Name)
+	buf.StartTransaction(t.name)
 
 	// Make a pass over the dirty chains and generate a forward reference for any that we're about to update.
 	// Writing a forward reference ensures that the chain exists and that it is empty.
@@ -1061,7 +1156,7 @@ func (t *Table) applyUpdates() error {
 			// where only the first replace command sets the rule index.  Work around that by refreshing the
 			// whole chain using a flush.
 			chain, _ := t.desiredStateOfChain(chainName)
-			currentHashes := chain.RuleHashes(features)
+			currentHashes := t.render.RuleHashes(chain, features)
 			previousHashes := t.chainToDataplaneHashes[chainName]
 			t.logCxt.WithFields(log.Fields{
 				"previous": previousHashes,
@@ -1100,7 +1195,7 @@ func (t *Table) applyUpdates() error {
 				// In iptables legacy mode, we compare the rules one by one and apply deltas rule by rule.
 				previousHashes = t.chainToDataplaneHashes[chainName]
 			}
-			currentHashes := chain.RuleHashes(features)
+			currentHashes := t.render.RuleHashes(chain, features)
 			newHashes[chainName] = currentHashes
 			for i := 0; i < len(previousHashes) || i < len(currentHashes); i++ {
 				var line string
@@ -1110,16 +1205,14 @@ func (t *Table) applyUpdates() error {
 					}
 					// Hash doesn't match, replace the rule.
 					ruleNum := i + 1 // 1-indexed.
-					prefixFrag := t.commentFrag(currentHashes[i])
-					line = chain.Rules[i].RenderReplace(chainName, ruleNum, prefixFrag, features)
+					line = t.render.RenderReplace(&chain.Rules[i], chainName, ruleNum, currentHashes[i], features)
 				} else if i < len(previousHashes) {
 					// previousHashes was longer, remove the old rules from the end.
 					ruleNum := len(currentHashes) + 1 // 1-indexed
 					line = t.renderDeleteByIndexLine(chainName, ruleNum)
 				} else {
 					// currentHashes was longer.  Append.
-					prefixFrag := t.commentFrag(currentHashes[i])
-					line = chain.Rules[i].RenderAppend(chainName, prefixFrag, features)
+					line = t.render.RenderAppend(&chain.Rules[i], chainName, currentHashes[i], features)
 				}
 				buf.WriteLine(line)
 			}
@@ -1182,8 +1275,7 @@ func (t *Table) applyUpdates() error {
 				// reverse order so that they end up in the correct order in the final
 				// state of the chain.
 				for i := len(rules) - 1; i >= 0; i-- {
-					prefixFrag := t.commentFrag(newInsertedRuleHashes[i])
-					line := rules[i].RenderInsert(chainName, prefixFrag, features)
+					line := t.render.RenderInsert(&rules[i], chainName, newInsertedRuleHashes[i], features)
 					buf.WriteLine(line)
 					insertRuleLines[i] = line
 				}
@@ -1191,8 +1283,7 @@ func (t *Table) applyUpdates() error {
 			} else {
 				t.logCxt.Debug("Rendering append rules.")
 				for i := 0; i < len(rules); i++ {
-					prefixFrag := t.commentFrag(newInsertedRuleHashes[i])
-					line := rules[i].RenderAppend(chainName, prefixFrag, features)
+					line := t.render.RenderAppend(&rules[i], chainName, newInsertedRuleHashes[i], features)
 					buf.WriteLine(line)
 					insertRuleLines[i] = line
 				}
@@ -1207,8 +1298,7 @@ func (t *Table) applyUpdates() error {
 		if len(rules) > 0 {
 			t.logCxt.Debug("Rendering specific append rules.")
 			for i := 0; i < len(rules); i++ {
-				prefixFrag := t.commentFrag(newAppendedRuleHashes[i])
-				line := rules[i].RenderAppend(chainName, prefixFrag, features)
+				line := t.render.RenderAppend(&rules[i], chainName, newAppendedRuleHashes[i], features)
 				buf.WriteLine(line)
 				appendRuleLines[i] = line
 			}
@@ -1232,7 +1322,7 @@ func (t *Table) applyUpdates() error {
 		// refresh its state.  The buffer will discard a no-op transaction so we don't need to check.
 		t.logCxt.Debug("In nftables mode, restarting transaction between updates and deletions.")
 		buf.EndTransaction()
-		buf.StartTransaction(t.Name)
+		buf.StartTransaction(t.name)
 
 		t.dirtyChains.Iter(func(chainName string) error {
 			if _, ok := t.desiredStateOfChain(chainName); !ok {
@@ -1264,14 +1354,30 @@ func (t *Table) applyUpdates() error {
 	} else {
 		// Get the contents of the buffer ready to send to iptables-restore.  Warning: for perf, this is directly
 		// accessing the buffer's internal array; don't touch the buffer after this point.
-		t.opReporter.RecordOperation(fmt.Sprintf("update-%v-v%d", t.Name, t.IPVersion))
+		t.opReporter.RecordOperation(fmt.Sprintf("update-%v-v%d", t.name, t.ipVersion))
 
 		if err := t.execIptablesRestore(buf); err != nil {
-			return fmt.Errorf("writting out buffer: %w", err)
+			return fmt.Errorf("writing out buffer: %w", err)
 		}
 
 		t.lastWriteTime = t.timeNow()
 		t.postWriteInterval = t.initialPostWriteInterval
+	}
+
+	if t.postWriteInterval != 0 {
+		// If iptables-save/restore is taking a long time (as measured by
+		// the peakIptablesX fields), make sure that we don't try to
+		// recheck the iptables state too soon.
+		dynamicMinPostWriteInterval := (t.peakIptablesSaveTime + t.peakIptablesRestoreTime) * 2
+		if t.postWriteInterval < dynamicMinPostWriteInterval {
+			log.WithFields(log.Fields{
+				"dynamicMin":  dynamicMinPostWriteInterval,
+				"peakSave":    t.peakIptablesSaveTime,
+				"peakRestore": t.peakIptablesRestoreTime,
+			}).Debug(
+				"Post write interval shorter than time to read/write iptables, applying dynamic minimum.")
+			t.postWriteInterval = dynamicMinPostWriteInterval
+		}
 	}
 
 	// Now we've successfully updated iptables, clear the dirty sets.  We do this even if we
@@ -1294,6 +1400,16 @@ func (t *Table) applyUpdates() error {
 }
 
 func (t *Table) execIptablesRestore(buf *RestoreInputBuilder) error {
+	startTime := t.timeNow()
+	defer func() {
+		restoreDuration := t.timeNow().Sub(startTime)
+		t.peakIptablesRestoreTime = t.peakIptablesRestoreTime * 99 / 100
+		if restoreDuration > t.peakIptablesRestoreTime {
+			log.WithField("duration", restoreDuration).Debug("Updating iptables-restore peak duration.")
+			t.peakIptablesRestoreTime = restoreDuration
+		}
+	}()
+
 	features := t.featureDetector.GetFeatures()
 	inputBytes := buf.GetBytesAndReset()
 
@@ -1358,7 +1474,7 @@ func (t *Table) execIptablesRestore(buf *RestoreInputBuilder) error {
 
 // CheckRulesPresent returns list of rules with the hashes that are already
 // programmed. Return value of nil means that none of the rules are present.
-func (t *Table) CheckRulesPresent(chain string, rules []Rule) []Rule {
+func (t *Table) CheckRulesPresent(chain string, rules []generictables.Rule) []generictables.Rule {
 	features := t.featureDetector.GetFeatures()
 
 	hashes := CalculateRuleHashes(chain, rules, features)
@@ -1369,7 +1485,7 @@ func (t *Table) CheckRulesPresent(chain string, rules []Rule) []Rule {
 		dpHashesSet.Add(h)
 	}
 
-	var present []Rule
+	var present []generictables.Rule
 	for i, r := range rules {
 		if dpHashesSet.Contains(hashes[i]) {
 			present = append(present, r)
@@ -1382,21 +1498,20 @@ func (t *Table) CheckRulesPresent(chain string, rules []Rule) []Rule {
 // InsertRulesNow insets the given rules immediately without removing or syncing
 // other rules. This is primarily useful when bootstrapping and we cannot wait
 // until we have the full state.
-func (t *Table) InsertRulesNow(chain string, rules []Rule) error {
+func (t *Table) InsertRulesNow(chain string, rules []generictables.Rule) error {
 	features := t.featureDetector.GetFeatures()
 
 	hashes := CalculateRuleHashes(chain, rules, features)
 
 	buf := new(RestoreInputBuilder)
-	buf.StartTransaction(t.Name)
+	buf.StartTransaction(t.name)
 	for i, r := range rules {
-		prefixFrag := t.commentFrag(hashes[i])
-		buf.WriteLine(r.RenderInsertAtRuleNumber(chain, i+1, prefixFrag, features))
+		buf.WriteLine(t.render.RenderInsertAtRuleNumber(&r, chain, i+1, hashes[i], features))
 	}
 	buf.EndTransaction()
 
 	if err := t.execIptablesRestore(buf); err != nil {
-		return fmt.Errorf("writting out buffer: %w", err)
+		return fmt.Errorf("writing out buffer: %w", err)
 	}
 
 	return nil
@@ -1404,16 +1519,12 @@ func (t *Table) InsertRulesNow(chain string, rules []Rule) error {
 
 // desiredStateOfChain returns the given chain, if and only if it exists in the cache and it is referenced by some
 // other chain.  If the chain doesn't exist or it is not referenced, returns nil and false.
-func (t *Table) desiredStateOfChain(chainName string) (chain *Chain, present bool) {
-	if t.chainRefCounts[chainName] == 0 {
+func (t *Table) desiredStateOfChain(chainName string) (chain *generictables.Chain, present bool) {
+	if !t.chainIsReferenced(chainName) {
 		return
 	}
 	chain, present = t.chainNameToChain[chainName]
 	return
-}
-
-func (t *Table) commentFrag(hash string) string {
-	return fmt.Sprintf(`-m comment --comment "%s%s"`, t.hashCommentPrefix, hash)
 }
 
 // renderDeleteByIndexLine produces a delete line by rule number. This function is used for cali chains.
@@ -1427,7 +1538,7 @@ func (t *Table) renderDeleteByValueLine(chainName string, ruleNum int) (string, 
 	// For non-cali chains, get the rule by number but delete using the full rule instead of rule number.
 	rules, ok := t.chainToFullRules[chainName]
 	if !ok || ruleNum >= len(rules) {
-		return "", fmt.Errorf("Rendering delete for non-existent rule: Rule %d in %q", ruleNum, chainName)
+		return "", fmt.Errorf("Rendering delete for nonexistent rule: Rule %d in %q", ruleNum, chainName)
 	}
 
 	rule := rules[ruleNum]
@@ -1436,12 +1547,16 @@ func (t *Table) renderDeleteByValueLine(chainName string, ruleNum int) (string, 
 	return strings.Replace(rule, "-A", "-D", 1), nil
 }
 
-func CalculateRuleHashes(chainName string, rules []Rule, features *environment.Features) []string {
-	chain := Chain{
+func (t *Table) UnexpectedInsertsSeen() int {
+	return t.unexpectedInsertsSeen
+}
+
+func CalculateRuleHashes(chainName string, rules []generictables.Rule, features *environment.Features) []string {
+	chain := generictables.Chain{
 		Name:  chainName,
 		Rules: rules,
 	}
-	return (&chain).RuleHashes(features)
+	return NewIptablesRenderer("").RuleHashes(&chain, features)
 }
 
 func numEmptyStrings(strs []string) int {
@@ -1453,21 +1568,3 @@ func numEmptyStrings(strs []string) int {
 	}
 	return count
 }
-
-// NoopTable fulfils the Table interface but does nothing.
-type NoopTable struct{}
-
-func NewNoopTable() *NoopTable {
-	return new(NoopTable)
-}
-
-func (t *NoopTable) Name() string                                       { return "" }
-func (t *NoopTable) IPVersion() uint8                                   { return 0 }
-func (t *NoopTable) InsertOrAppendRules(chainName string, rules []Rule) {}
-func (t *NoopTable) AppendRules(chainName string, rules []Rule)         {}
-func (t *NoopTable) UpdateChain(chain *Chain)                           {}
-func (t *NoopTable) UpdateChains([]*Chain)                              {}
-func (t *NoopTable) RemoveChains([]*Chain)                              {}
-func (t *NoopTable) RemoveChainByName(name string)                      {}
-func (t *NoopTable) InvalidateDataplaneCache(reason string)             {}
-func (t *NoopTable) Apply() time.Duration                               { return 0 }

@@ -22,13 +22,13 @@ import (
 	"regexp"
 	"time"
 
+	gocidr "github.com/apparentlymart/go-cidr/cidr"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	gocidr "github.com/apparentlymart/go-cidr/cidr"
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/fv/containers"
 	"github.com/projectcalico/calico/kube-controllers/tests/testutils"
@@ -39,9 +39,6 @@ import (
 	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
 )
 
 const (
@@ -231,7 +228,7 @@ var _ = Describe("flannel-migration-controller FV test", func() {
 			_, err := calicoClient.IPPools().Create(context.Background(), p, options.SetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			// Remove flannel daemonset, add Canal daemonet.
+			// Remove flannel daemonset, add Canal daemonset.
 			_, err = apiserver.ExecOutput("kubectl", "delete", "daemonset", flannelDs, "-n", "kube-system")
 			Expect(err).ShouldNot(HaveOccurred())
 			flannelCluster.AddCanalDaemonset("canal")
@@ -342,7 +339,7 @@ func validateCalicoIPAM(fc *testutils.FlannelCluster, client client.Interface, b
 		Expect(attr[ipam.AttributeType]).To(Equal(ipam.AttributeTypeVXLAN))
 
 		// Check block affinities been correctly claimed.
-		opts := model.BlockAffinityListOptions{Host: nodeName, IPVersion: 4}
+		opts := model.BlockAffinityListOptions{Host: nodeName, AffinityType: string(ipam.AffinityTypeHost), IPVersion: 4}
 		datastoreObjs, err := bc.List(context.Background(), opts, "")
 		Expect(err).ShouldNot(HaveOccurred())
 		// Iterate through and extract the block CIDRs.

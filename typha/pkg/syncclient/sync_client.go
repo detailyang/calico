@@ -27,9 +27,8 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
 	"github.com/golang/snappy"
+	log "github.com/sirupsen/logrus"
 
 	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -67,9 +66,6 @@ type Options struct {
 	// DebugDiscardKVUpdates discards all KV updates from typha without decoding them.
 	// Useful for load testing Typha without having to run a "full" client.
 	DebugDiscardKVUpdates bool
-
-	// FIPSModeEnabled Enables FIPS 140-2 verified crypto mode.
-	FIPSModeEnabled bool
 }
 
 func (o *Options) readTimeout() time.Duration {
@@ -124,13 +120,17 @@ func New(
 	if options == nil {
 		options = &Options{}
 	}
+	cbskn, ok := cbs.(callbacksWithKeysKnown)
+	if !ok {
+		cbskn = callbacksWithKeysKnownAdapter{cbs}
+	}
 	return &SyncerClient{
 		ID: id,
 		logCxt: log.WithFields(log.Fields{
 			"myID": id,
 			"type": options.SyncerType,
 		}),
-		callbacks:  cbs,
+		callbacks:  cbskn,
 		discoverer: discoverer,
 
 		myVersion:  myVersion,
@@ -159,8 +159,21 @@ type SyncerClient struct {
 	handshakeStatus             *handshakeStatus
 	supportsNodeResourceUpdates bool
 
-	callbacks api.SyncerCallbacks
+	callbacks callbacksWithKeysKnown
 	Finished  sync.WaitGroup
+}
+
+type callbacksWithKeysKnown interface {
+	api.SyncerCallbacks
+	OnUpdatesKeysKnown(updates []api.Update, keys []string)
+}
+
+type callbacksWithKeysKnownAdapter struct {
+	api.SyncerCallbacks
+}
+
+func (c callbacksWithKeysKnownAdapter) OnUpdatesKeysKnown(updates []api.Update, keys []string) {
+	c.OnUpdates(updates)
 }
 
 type handshakeStatus struct {
@@ -268,7 +281,7 @@ func (s *SyncerClient) connect(cxt context.Context, typhaAddr discovery.Typha) e
 			log.WithError(err).Error("Failed to load certificate and key")
 			return err
 		}
-		tlsConfig := calicotls.NewTLSConfig(s.options.FIPSModeEnabled)
+		tlsConfig := calicotls.NewTLSConfig()
 		tlsConfig.Certificates = []tls.Certificate{cert}
 		// Typha API is a private binary API so we can enforce a recent TLS variant without
 		// worrying about back-compatibility with old browsers (for example).
@@ -482,6 +495,7 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 			logCxt.Debug("Pong sent to Typha")
 		case syncproto.MsgKVs:
 			updates := make([]api.Update, 0, len(msg.KVs))
+			keys := make([]string, 0, len(msg.KVs))
 			if s.options.DebugDiscardKVUpdates {
 				// For simulating lots of clients in tests, just throw away the data.
 				continue
@@ -499,8 +513,9 @@ func (s *SyncerClient) loop(cxt context.Context, cancelFn context.CancelFunc) {
 					}).Debug("Decoded update from Typha")
 				}
 				updates = append(updates, update)
+				keys = append(keys, kv.Key)
 			}
-			s.callbacks.OnUpdates(updates)
+			s.callbacks.OnUpdatesKeysKnown(updates, keys)
 		case syncproto.MsgDecoderRestart:
 			if s.options.DisableDecoderRestart {
 				log.Error("Server sent MsgDecoderRestart but we signalled no support.")

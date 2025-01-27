@@ -20,7 +20,6 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -85,7 +84,7 @@ var _ = Describe("BPF service type change", func() {
 
 	initIP := net.IPv4(1, 1, 1, 1)
 
-	bpfMaps := &bpfmap.Maps{}
+	bpfMaps := &bpfmap.IPMaps{}
 	bpfMaps.FrontendMap = newMockNATMap()
 	bpfMaps.BackendMap = newMockNATBackendMap()
 	bpfMaps.AffinityMap = newMockAffinityMap()

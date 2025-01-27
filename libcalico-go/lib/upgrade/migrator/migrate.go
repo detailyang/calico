@@ -23,12 +23,11 @@ import (
 	"time"
 
 	"github.com/coreos/go-semver/semver"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/projectcalico/api/pkg/lib/numorstring"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	"github.com/projectcalico/api/pkg/lib/numorstring"
 
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
 	bapi "github.com/projectcalico/calico/libcalico-go/lib/backend/api"
@@ -475,6 +474,18 @@ func (m *migrationHelper) queryAndConvertResources() (*MigrationData, error) {
 	}
 
 	if m.clientv1.IsKDD() {
+		m.statusBullet("skipping Tier resources - these do not need migrating")
+	} else {
+		m.statusBullet("handling Tier resources")
+		// Query and convert the Tiers
+		if err := m.queryAndConvertV1ToV3Resources(
+			data, model.TierListOptions{}, converters.Tier{}, noFilter,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	if m.clientv1.IsKDD() {
 		m.statusBullet("skipping GlobalNetworkPolicy resources - these do not need migrating")
 	} else {
 		m.statusBullet("handling GlobalNetworkPolicy resources")
@@ -806,7 +817,7 @@ func (m *migrationHelper) getV1ClusterVersion() (string, error) {
 }
 
 // versionRequiresMigration returns true if the given version requires
-// upgrating the data model, false otherwise. Returns an error if it was
+// upgrading the data model, false otherwise. Returns an error if it was
 // not possible to parse the version, or if the version was less than the
 // minimum requires for upgrade.
 func versionRequiresMigration(v string) (bool, error) {

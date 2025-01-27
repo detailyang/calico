@@ -23,9 +23,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
 	"github.com/projectcalico/calico/felix/bpf"
+	"github.com/projectcalico/calico/felix/bpf/bpfdefs"
+	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
 // CleanUpProgramsAndPins makes a best effort to remove all our TC BPF programs.
@@ -49,7 +49,8 @@ func CleanUpProgramsAndPins() {
 	}
 	calicoMapIDs := set.New[int]()
 	for _, m := range maps {
-		if strings.HasPrefix(m.Name, "cali_") || strings.HasPrefix(m.Name, "calico_") {
+		if strings.HasPrefix(m.Name, "cali_") || strings.HasPrefix(m.Name, "calico_") ||
+			strings.HasPrefix(m.Name, "xdp_cali_") {
 			log.WithField("name", m.Name).Debug("Found calico map")
 			calicoMapIDs.Add(m.ID)
 		}
@@ -119,7 +120,7 @@ func CleanUpProgramsAndPins() {
 		return nil
 	})
 
-	bpf.CleanUpCalicoPins("/sys/fs/bpf/tc")
+	bpf.CleanUpCalicoPins(bpfdefs.DefaultBPFfsPath)
 }
 
 var tcFiltRegex = regexp.MustCompile(`filter .*? bpf .*? id (\d+)`)

@@ -1,4 +1,4 @@
-# Copyright (c) 2015-2016 Tigera, Inc. All rights reserved.
+# Copyright (c) 2015-2016,2024 Tigera, Inc. All rights reserved.
 # Copyright IBM Corp. 2017
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,22 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-ARG QEMU_IMAGE=calico/go-build:latest
+ARG QEMU_IMAGE
 ARG BIRD_IMAGE
 
-FROM ${QEMU_IMAGE} as qemu
-FROM ${BIRD_IMAGE} as bird
+FROM ${QEMU_IMAGE} AS qemu
+FROM ${BIRD_IMAGE} AS bird
 
-FROM calico/bpftool:v5.3-s390x as bpftool
+FROM calico/bpftool:v7.4.0 AS bpftool
 
-FROM s390x/alpine:3.8 as base
+FROM s390x/alpine:3.18 AS base
+
+ARG ARCH=s390x
+ARG GIT_VERSION
+
+# Tell sv where to find the services.
+ENV SVDIR=/etc/service/enabled
+
+# Required labels for certification
+LABEL description="Calico node handles networking and policy for Calico"
+LABEL maintainer="maintainers@tigera.io"
+LABEL name="Calico node"
+LABEL release="1"
+LABEL summary="Calico node handles networking and policy for Calico"
+LABEL vendor="Project Calico"
+LABEL version=${GIT_VERSION}
+
 # Enable non-native builds of this image on an amd64 hosts.
 # This must be the first RUN command in this file!
-COPY --from=qemu /usr/bin/qemu-*-static /usr/bin/
-ARG ARCH=s390x
+COPY --from=qemu /usr/bin/qemu-s390x-static /usr/bin/qemu-s390x-static
 
 # Install remaining runtime deps required for felix from the global repository
-RUN apk add --no-cache ip6tables ipset iputils iproute2 conntrack-tools runit file ca-certificates
+RUN apk add --no-cache bash ip6tables ipset iputils iproute2 conntrack-tools runit file ca-certificates
 
 # Copy our bird binaries in
 COPY --from=bird /bird* /bin/
@@ -35,10 +50,13 @@ COPY --from=bird /bird* /bin/
 # Copy in the filesystem - this contains felix, calico-bgp-daemon etc...
 COPY filesystem/ /
 
+# Add in top-level license file
+COPY LICENSE /licenses/LICENSE
+
 # Copy in the calico-node binary
 COPY dist/bin/calico-node-${ARCH} /bin/calico-node
 
-# Copy in the moutnns binary
+# Copy in the mountns binary
 COPY dist/bin/mountns-${ARCH} /bin/mountns
 
 # Set the suid bit on mountns
@@ -49,16 +67,6 @@ COPY --from=bpftool /bpftool /bin
 # Add in top-level license file
 COPY LICENSE /licenses
 
+RUN rm /usr/bin/qemu-s390x-static
+
 CMD ["start_runit"]
-
-# Required labels for certification
-LABEL name="Calico node" \
-      vendor="Project Calico" \
-      version=$GIT_VERSION \
-      release="1" \
-      summary="Calico node handles networking and policy for Calico" \
-      description="Calico node handles networking and policy for Calico" \
-      maintainer="laurence@tigera.io"
-
-# Tell sv where to find the services.
-ENV SVDIR=/etc/service/enabled

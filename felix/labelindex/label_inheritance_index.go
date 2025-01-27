@@ -46,9 +46,8 @@ package labelindex
 import (
 	"reflect"
 
-	log "github.com/sirupsen/logrus"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
@@ -122,7 +121,7 @@ func NewInheritIndex(onMatchStarted, onMatchStopped MatchCallback) *InheritIndex
 		OnMatchStarted: onMatchStarted,
 		OnMatchStopped: onMatchStopped,
 
-		dirtyItemIDs: set.NewBoxed[any](),
+		dirtyItemIDs: set.New[any](),
 	}
 	return &inheritIDx
 }
@@ -179,7 +178,10 @@ func (idx *InheritIndex) UpdateSelector(id interface{}, sel selector.Selector) {
 		log.WithField("selID", id).Debug("Skipping unchanged selector")
 		return
 	}
-	log.WithField("selID", id).Info("Updating selector")
+	log.WithFields(log.Fields{
+		"id":       id,
+		"selector": sel,
+	}).Info("Updating selector")
 	idx.scanAllLabels(id, sel)
 	idx.selectorsById[id] = sel
 }
@@ -275,7 +277,7 @@ func (idx *InheritIndex) onItemParentsUpdate(id interface{}, oldParents, newPare
 	// Calculate the current set of parent IDs so we can skip deletion of parents that are still
 	// present.  We need to do this to avoid removing a still-current parent via
 	// discardParentIfEmpty().
-	currentParentIDs := set.NewBoxed[any]()
+	currentParentIDs := set.New[any]()
 	for _, parentData := range newParents {
 		currentParentIDs.Add(parentData.id)
 	}
@@ -294,7 +296,7 @@ func (idx *InheritIndex) onItemParentsUpdate(id interface{}, oldParents, newPare
 
 	for _, parent := range newParents {
 		if parent.itemIDs == nil {
-			parent.itemIDs = set.NewBoxed[any]()
+			parent.itemIDs = set.New[any]()
 		}
 		parent.itemIDs.Add(id)
 	}
@@ -386,7 +388,7 @@ func (idx *InheritIndex) updateMatches(
 func (idx *InheritIndex) storeMatch(selId, labelId interface{}) {
 	labelIds := idx.labelIdsBySelId[selId]
 	if labelIds == nil {
-		labelIds = set.NewBoxed[any]()
+		labelIds = set.New[any]()
 		idx.labelIdsBySelId[selId] = labelIds
 	}
 	previouslyMatched := labelIds.Contains(labelId)
@@ -396,7 +398,7 @@ func (idx *InheritIndex) storeMatch(selId, labelId interface{}) {
 
 		selIDs, ok := idx.selIdsByLabelId[labelId]
 		if !ok {
-			selIDs = set.NewBoxed[any]()
+			selIDs = set.New[any]()
 			idx.selIdsByLabelId[labelId] = selIDs
 		}
 		selIDs.Add(selId)

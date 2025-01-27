@@ -18,18 +18,16 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
-	homedir "github.com/mitchellh/go-homedir"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 var (
 	cfgFile  string
 	logLevel string
+
+	ipv6 *bool
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -41,9 +39,6 @@ var rootCmd = &cobra.Command{
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	// Make sure the RNG is seeded.
-	seedrng.EnsureSeeded()
-
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -56,12 +51,11 @@ func init() {
 	// Cobra supports persistent flags, which, if defined here,
 	// will be global for your application.
 
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.calico-bpf.yaml)")
+	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "",
+		"config file (default is $HOME/.calico-bpf.yaml)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "warn", "Set log level")
 
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	ipv6 = rootCmd.PersistentFlags().BoolP("ipv6", "6", false, "Use IPv6 instead of IPv4")
 	rootCmd.SetOut(os.Stdout)
 }
 
@@ -72,7 +66,7 @@ func initConfig() {
 		viper.SetConfigFile(cfgFile)
 	} else {
 		// Find home directory.
-		home, err := homedir.Dir()
+		home, err := os.UserHomeDir()
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)

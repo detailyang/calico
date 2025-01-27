@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@ import (
 	"fmt"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/ip"
 	"github.com/projectcalico/calico/felix/labelindex"
 	"github.com/projectcalico/calico/felix/multidict"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
@@ -49,8 +49,8 @@ type EventSequencer struct {
 	// updates and generate updates in dependency order.
 	pendingAddedIPSets           map[string]proto.IPSetUpdate_IPSetType
 	pendingRemovedIPSets         set.Set[string]
-	pendingAddedIPSetMembers     multidict.StringToIface
-	pendingRemovedIPSetMembers   multidict.StringToIface
+	pendingAddedIPSetMembers     multidict.Multidict[string, labelindex.IPSetMember]
+	pendingRemovedIPSetMembers   multidict.Multidict[string, labelindex.IPSetMember]
 	pendingPolicyUpdates         map[model.PolicyKey]*ParsedRules
 	pendingPolicyDeletes         set.Set[model.PolicyKey]
 	pendingProfileUpdates        map[model.ProfileRulesKey]*ParsedRules
@@ -70,10 +70,10 @@ type EventSequencer struct {
 	pendingNotReady              bool
 	pendingGlobalConfig          map[string]string
 	pendingHostConfig            map[string]string
-	pendingServiceAccountUpdates map[proto.ServiceAccountID]*proto.ServiceAccountUpdate
-	pendingServiceAccountDeletes set.Set[proto.ServiceAccountID]
-	pendingNamespaceUpdates      map[proto.NamespaceID]*proto.NamespaceUpdate
-	pendingNamespaceDeletes      set.Set[proto.NamespaceID]
+	pendingServiceAccountUpdates map[types.ServiceAccountID]*proto.ServiceAccountUpdate
+	pendingServiceAccountDeletes set.Set[types.ServiceAccountID]
+	pendingNamespaceUpdates      map[types.NamespaceID]*proto.NamespaceUpdate
+	pendingNamespaceDeletes      set.Set[types.NamespaceID]
 	pendingRouteUpdates          map[routeID]*proto.RouteUpdate
 	pendingRouteDeletes          set.Set[routeID]
 	pendingVTEPUpdates           map[string]*proto.VXLANTunnelEndpointUpdate
@@ -93,8 +93,8 @@ type EventSequencer struct {
 	sentHostIPv6s       set.Set[string]
 	sentHosts           set.Set[string]
 	sentIPPools         set.Set[ip.CIDR]
-	sentServiceAccounts set.Set[proto.ServiceAccountID]
-	sentNamespaces      set.Set[proto.NamespaceID]
+	sentServiceAccounts set.Set[types.ServiceAccountID]
+	sentNamespaces      set.Set[types.NamespaceID]
 	sentRoutes          set.Set[routeID]
 	sentVTEPs           set.Set[string]
 	sentWireguard       set.Set[string]
@@ -131,8 +131,8 @@ func NewEventSequencer(conf configInterface) *EventSequencer {
 		config:                     conf,
 		pendingAddedIPSets:         map[string]proto.IPSetUpdate_IPSetType{},
 		pendingRemovedIPSets:       set.New[string](),
-		pendingAddedIPSetMembers:   multidict.NewStringToIface(),
-		pendingRemovedIPSetMembers: multidict.NewStringToIface(),
+		pendingAddedIPSetMembers:   multidict.New[string, labelindex.IPSetMember](),
+		pendingRemovedIPSetMembers: multidict.New[string, labelindex.IPSetMember](),
 
 		pendingPolicyUpdates:         map[model.PolicyKey]*ParsedRules{},
 		pendingPolicyDeletes:         set.New[model.PolicyKey](),
@@ -140,7 +140,7 @@ func NewEventSequencer(conf configInterface) *EventSequencer {
 		pendingProfileDeletes:        set.New[model.ProfileRulesKey](),
 		pendingEndpointUpdates:       map[model.Key]interface{}{},
 		pendingEndpointTierUpdates:   map[model.Key][]TierInfo{},
-		pendingEndpointDeletes:       set.NewBoxed[model.Key](),
+		pendingEndpointDeletes:       set.New[model.Key](),
 		pendingHostIPUpdates:         map[string]*net.IP{},
 		pendingHostIPDeletes:         set.New[string](),
 		pendingHostIPv6Updates:       map[string]*net.IP{},
@@ -148,11 +148,11 @@ func NewEventSequencer(conf configInterface) *EventSequencer {
 		pendingHostMetadataUpdates:   map[string]*hostInfo{},
 		pendingHostMetadataDeletes:   set.New[string](),
 		pendingIPPoolUpdates:         map[ip.CIDR]*model.IPPool{},
-		pendingIPPoolDeletes:         set.NewBoxed[ip.CIDR](),
-		pendingServiceAccountUpdates: map[proto.ServiceAccountID]*proto.ServiceAccountUpdate{},
-		pendingServiceAccountDeletes: set.New[proto.ServiceAccountID](),
-		pendingNamespaceUpdates:      map[proto.NamespaceID]*proto.NamespaceUpdate{},
-		pendingNamespaceDeletes:      set.New[proto.NamespaceID](),
+		pendingIPPoolDeletes:         set.New[ip.CIDR](),
+		pendingServiceAccountUpdates: map[types.ServiceAccountID]*proto.ServiceAccountUpdate{},
+		pendingServiceAccountDeletes: set.New[types.ServiceAccountID](),
+		pendingNamespaceUpdates:      map[types.NamespaceID]*proto.NamespaceUpdate{},
+		pendingNamespaceDeletes:      set.New[types.NamespaceID](),
 		pendingRouteUpdates:          map[routeID]*proto.RouteUpdate{},
 		pendingRouteDeletes:          set.New[routeID](),
 		pendingVTEPUpdates:           map[string]*proto.VXLANTunnelEndpointUpdate{},
@@ -166,13 +166,13 @@ func NewEventSequencer(conf configInterface) *EventSequencer {
 		sentIPSets:          set.New[string](),
 		sentPolicies:        set.New[model.PolicyKey](),
 		sentProfiles:        set.New[model.ProfileRulesKey](),
-		sentEndpoints:       set.NewBoxed[model.Key](),
+		sentEndpoints:       set.New[model.Key](),
 		sentHostIPs:         set.New[string](),
 		sentHostIPv6s:       set.New[string](),
 		sentHosts:           set.New[string](),
-		sentIPPools:         set.NewBoxed[ip.CIDR](),
-		sentServiceAccounts: set.New[proto.ServiceAccountID](),
-		sentNamespaces:      set.New[proto.NamespaceID](),
+		sentIPPools:         set.New[ip.CIDR](),
+		sentServiceAccounts: set.New[types.ServiceAccountID](),
+		sentNamespaces:      set.New[types.NamespaceID](),
 		sentRoutes:          set.New[routeID](),
 		sentVTEPs:           set.New[string](),
 		sentWireguard:       set.New[string](),
@@ -304,7 +304,7 @@ func (buf *EventSequencer) flushPolicyUpdates() {
 func ParsedRulesToActivePolicyUpdate(key model.PolicyKey, rules *ParsedRules) *proto.ActivePolicyUpdate {
 	return &proto.ActivePolicyUpdate{
 		Id: &proto.PolicyID{
-			Tier: "default",
+			Tier: key.Tier,
 			Name: key.Name,
 		},
 		Policy: &proto.Policy{
@@ -317,8 +317,9 @@ func ParsedRulesToActivePolicyUpdate(key model.PolicyKey, rules *ParsedRules) *p
 				rules.OutboundRules,
 				"pol-out-default/"+key.Name,
 			),
-			Untracked: rules.Untracked,
-			PreDnat:   rules.PreDNAT,
+			Untracked:        rules.Untracked,
+			PreDnat:          rules.PreDNAT,
+			OriginalSelector: rules.OriginalSelector,
 		},
 	}
 }
@@ -334,7 +335,7 @@ func (buf *EventSequencer) flushPolicyDeletes() {
 	buf.pendingPolicyDeletes.Iter(func(item model.PolicyKey) error {
 		buf.Callback(&proto.ActivePolicyRemove{
 			Id: &proto.PolicyID{
-				Tier: "default",
+				Tier: item.Tier,
 				Name: item.Name,
 			},
 		})
@@ -527,9 +528,13 @@ func (buf *EventSequencer) OnHostIPUpdate(hostname string, ip *net.IP) {
 
 func (buf *EventSequencer) flushHostIPUpdates() {
 	for hostname, hostIP := range buf.pendingHostIPUpdates {
+		hostAddr := ""
+		if hostIP != nil {
+			hostAddr = hostIP.IP.String()
+		}
 		buf.Callback(&proto.HostMetadataUpdate{
 			Hostname: hostname,
-			Ipv4Addr: hostIP.IP.String(),
+			Ipv4Addr: hostAddr,
 		})
 		buf.sentHostIPs.Add(hostname)
 		delete(buf.pendingHostIPUpdates, hostname)
@@ -565,9 +570,13 @@ func (buf *EventSequencer) OnHostIPv6Update(hostname string, ip *net.IP) {
 
 func (buf *EventSequencer) flushHostIPv6Updates() {
 	for hostname, hostIP := range buf.pendingHostIPv6Updates {
+		hostIPv6Addr := ""
+		if hostIP != nil {
+			hostIPv6Addr = hostIP.IP.String()
+		}
 		buf.Callback(&proto.HostMetadataV6Update{
 			Hostname: hostname,
-			Ipv6Addr: hostIP.IP.String(),
+			Ipv6Addr: hostIPv6Addr,
 		})
 		buf.sentHostIPv6s.Add(hostname)
 		delete(buf.pendingHostIPv6Updates, hostname)
@@ -763,8 +772,7 @@ func (buf *EventSequencer) flushAddedIPSets() {
 	for setID, setType := range buf.pendingAddedIPSets {
 		log.WithField("setID", setID).Debug("Flushing added IP set")
 		members := make([]string, 0)
-		buf.pendingAddedIPSetMembers.Iter(setID, func(value interface{}) {
-			member := value.(labelindex.IPSetMember)
+		buf.pendingAddedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
 			members = append(members, memberToProto(member))
 		})
 		buf.pendingAddedIPSetMembers.DiscardKey(setID)
@@ -818,7 +826,7 @@ func (buf *EventSequencer) Flush() {
 
 	// Flush VXLAN data. Order such that no routes are present in the data plane unless
 	// they have a corresponding VTEP in the data plane as well. Do this by sending VTEP adds
-	// before flushsing route adds, and route removes before flushing VTEP removes. We also send
+	// before flushing route adds, and route removes before flushing VTEP removes. We also send
 	// route removes before route adds in order to minimize maximum occupancy.
 	buf.flushRouteRemoves()
 	buf.flushVTEPRemoves()
@@ -874,12 +882,10 @@ func (buf *EventSequencer) flushAddsOrRemoves(setID string) {
 	deltaUpdate := proto.IPSetDeltaUpdate{
 		Id: setID,
 	}
-	buf.pendingAddedIPSetMembers.Iter(setID, func(item interface{}) {
-		member := item.(labelindex.IPSetMember)
+	buf.pendingAddedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
 		deltaUpdate.AddedMembers = append(deltaUpdate.AddedMembers, memberToProto(member))
 	})
-	buf.pendingRemovedIPSetMembers.Iter(setID, func(item interface{}) {
-		member := item.(labelindex.IPSetMember)
+	buf.pendingRemovedIPSetMembers.Iter(setID, func(member labelindex.IPSetMember) {
 		deltaUpdate.RemovedMembers = append(deltaUpdate.RemovedMembers, memberToProto(member))
 	})
 	buf.pendingAddedIPSetMembers.DiscardKey(setID)
@@ -889,7 +895,7 @@ func (buf *EventSequencer) flushAddsOrRemoves(setID string) {
 
 func (buf *EventSequencer) OnServiceAccountUpdate(update *proto.ServiceAccountUpdate) {
 	// We trust the caller not to send us an update with nil ID, so safe to dereference.
-	id := *update.Id
+	id := types.ProtoToServiceAccountID(update.Id)
 	log.WithFields(log.Fields{
 		"key":    id,
 		"labels": update.GetLabels(),
@@ -898,7 +904,7 @@ func (buf *EventSequencer) OnServiceAccountUpdate(update *proto.ServiceAccountUp
 	buf.pendingServiceAccountUpdates[id] = update
 }
 
-func (buf *EventSequencer) OnServiceAccountRemove(id proto.ServiceAccountID) {
+func (buf *EventSequencer) OnServiceAccountRemove(id types.ServiceAccountID) {
 	log.WithFields(log.Fields{
 		"key": id,
 	}).Debug("ServiceAccount removed")
@@ -910,8 +916,9 @@ func (buf *EventSequencer) OnServiceAccountRemove(id proto.ServiceAccountID) {
 
 func (buf *EventSequencer) flushServiceAccounts() {
 	// Order doesn't matter, but send removes first to reduce max occupancy
-	buf.pendingServiceAccountDeletes.Iter(func(id proto.ServiceAccountID) error {
-		msg := proto.ServiceAccountRemove{Id: &id}
+	buf.pendingServiceAccountDeletes.Iter(func(id types.ServiceAccountID) error {
+		protoID := types.ServiceAccountIDToProto(id)
+		msg := proto.ServiceAccountRemove{Id: protoID}
 		buf.Callback(&msg)
 		buf.sentServiceAccounts.Discard(id)
 		return nil
@@ -919,18 +926,18 @@ func (buf *EventSequencer) flushServiceAccounts() {
 	buf.pendingServiceAccountDeletes.Clear()
 	for _, msg := range buf.pendingServiceAccountUpdates {
 		buf.Callback(msg)
-		id := msg.Id
+		id := types.ProtoToServiceAccountID(msg.GetId())
 		// We safely dereferenced the Id in OnServiceAccountUpdate before adding it to the pending updates map, so
 		// it is safe to do so here.
-		buf.sentServiceAccounts.Add(*id)
+		buf.sentServiceAccounts.Add(id)
 	}
-	buf.pendingServiceAccountUpdates = make(map[proto.ServiceAccountID]*proto.ServiceAccountUpdate)
+	buf.pendingServiceAccountUpdates = make(map[types.ServiceAccountID]*proto.ServiceAccountUpdate)
 	log.Debug("Done flushing Service Accounts")
 }
 
 func (buf *EventSequencer) OnNamespaceUpdate(update *proto.NamespaceUpdate) {
 	// We trust the caller not to send us an update with nil ID, so safe to dereference.
-	id := *update.Id
+	id := types.ProtoToNamespaceID(update.GetId())
 	log.WithFields(log.Fields{
 		"key":    id,
 		"labels": update.GetLabels(),
@@ -939,7 +946,7 @@ func (buf *EventSequencer) OnNamespaceUpdate(update *proto.NamespaceUpdate) {
 	buf.pendingNamespaceUpdates[id] = update
 }
 
-func (buf *EventSequencer) OnNamespaceRemove(id proto.NamespaceID) {
+func (buf *EventSequencer) OnNamespaceRemove(id types.NamespaceID) {
 	log.WithFields(log.Fields{
 		"key": id,
 	}).Debug("Namespace removed")
@@ -970,12 +977,27 @@ func (buf *EventSequencer) OnGlobalBGPConfigUpdate(cfg *v3.BGPConfiguration) {
 	buf.pendingGlobalBGPConfig = &proto.GlobalBGPConfigUpdate{}
 	if cfg != nil {
 		for _, block := range cfg.Spec.ServiceClusterIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceClusterCidrs = append(buf.pendingGlobalBGPConfig.ServiceClusterCidrs, block.CIDR)
 		}
 		for _, block := range cfg.Spec.ServiceExternalIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceExternalCidrs = append(buf.pendingGlobalBGPConfig.ServiceExternalCidrs, block.CIDR)
 		}
 		for _, block := range cfg.Spec.ServiceLoadBalancerIPs {
+			if block.CIDR == "" {
+				// When we defined the CRD we allowed this field to be optional
+				// for extensibility, ignore empty CIDRs.
+				continue
+			}
 			buf.pendingGlobalBGPConfig.ServiceLoadbalancerCidrs = append(buf.pendingGlobalBGPConfig.ServiceLoadbalancerCidrs, block.CIDR)
 		}
 	}
@@ -983,8 +1005,9 @@ func (buf *EventSequencer) OnGlobalBGPConfigUpdate(cfg *v3.BGPConfiguration) {
 
 func (buf *EventSequencer) flushNamespaces() {
 	// Order doesn't matter, but send removes first to reduce max occupancy
-	buf.pendingNamespaceDeletes.Iter(func(id proto.NamespaceID) error {
-		msg := proto.NamespaceRemove{Id: &id}
+	buf.pendingNamespaceDeletes.Iter(func(id types.NamespaceID) error {
+		protoID := types.NamespaceIDToProto(id)
+		msg := proto.NamespaceRemove{Id: protoID}
 		buf.Callback(&msg)
 		buf.sentNamespaces.Discard(id)
 		return nil
@@ -992,12 +1015,12 @@ func (buf *EventSequencer) flushNamespaces() {
 	buf.pendingNamespaceDeletes.Clear()
 	for _, msg := range buf.pendingNamespaceUpdates {
 		buf.Callback(msg)
-		id := msg.Id
+		id := types.ProtoToNamespaceID(msg.GetId())
 		// We safely dereferenced the Id in OnNamespaceUpdate before adding it to the pending updates map, so
 		// it is safe to do so here.
-		buf.sentNamespaces.Add(*id)
+		buf.sentNamespaces.Add(id)
 	}
-	buf.pendingNamespaceUpdates = make(map[proto.NamespaceID]*proto.NamespaceUpdate)
+	buf.pendingNamespaceUpdates = make(map[types.NamespaceID]*proto.NamespaceUpdate)
 	log.Debug("Done flushing Namespaces")
 }
 
@@ -1146,17 +1169,19 @@ func addPolicyToTierInfo(pol *PolKV, tierInfo *proto.TierInfo, egressAllowed boo
 func tierInfoToProtoTierInfo(filteredTiers []TierInfo) (normalTiers, untrackedTiers, preDNATTiers, forwardTiers []*proto.TierInfo) {
 	if len(filteredTiers) > 0 {
 		for _, ti := range filteredTiers {
-			untrackedTierInfo := &proto.TierInfo{Name: ti.Name}
-			preDNATTierInfo := &proto.TierInfo{Name: ti.Name}
-			forwardTierInfo := &proto.TierInfo{Name: ti.Name}
-			normalTierInfo := &proto.TierInfo{Name: ti.Name}
+			// For untracked and preDNAT tiers, DefautlAction must be Pass, to make sure policies in the normal tier
+			// are also checked.
+			untrackedTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(v3.Pass)}
+			preDNATTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(v3.Pass)}
+			forwardTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(ti.DefaultAction)}
+			normalTierInfo := &proto.TierInfo{Name: ti.Name, DefaultAction: string(ti.DefaultAction)}
 			for _, pol := range ti.OrderedPolicies {
-				if pol.Value.DoNotTrack {
+				if pol.Value.DoNotTrack() {
 					addPolicyToTierInfo(&pol, untrackedTierInfo, true)
-				} else if pol.Value.PreDNAT {
+				} else if pol.Value.PreDNAT() {
 					addPolicyToTierInfo(&pol, preDNATTierInfo, false)
 				} else {
-					if pol.Value.ApplyOnForward {
+					if pol.Value.ApplyOnForward() {
 						addPolicyToTierInfo(&pol, forwardTierInfo, true)
 					}
 					addPolicyToTierInfo(&pol, normalTierInfo, true)

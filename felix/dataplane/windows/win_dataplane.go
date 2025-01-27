@@ -19,13 +19,11 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/projectcalico/calico/felix/dataplane/windows/hcn"
-
 	log "github.com/sirupsen/logrus"
 
+	dpsets "github.com/projectcalico/calico/felix/dataplane/ipsets"
+	"github.com/projectcalico/calico/felix/dataplane/windows/hcn"
 	"github.com/projectcalico/calico/felix/dataplane/windows/hns"
-
-	"github.com/projectcalico/calico/felix/dataplane/common"
 	"github.com/projectcalico/calico/felix/dataplane/windows/ipsets"
 	"github.com/projectcalico/calico/felix/dataplane/windows/policysets"
 	"github.com/projectcalico/calico/felix/jitter"
@@ -45,9 +43,7 @@ const (
 	reschedDelay = time.Duration(5) * time.Second
 )
 
-var (
-	processStartTime time.Time
-)
+var processStartTime time.Time
 
 func init() {
 	processStartTime = time.Now()
@@ -92,7 +88,7 @@ type Config struct {
 //
 // The dataplane does not do consistency checks on the incoming data. It expects to be told about
 // dependent resources before they are needed and for their lifetime to exceed that of the resources
-// that depend on them.  For example, it is important the the datastore layer send an IP set create
+// that depend on them.  For example, it is important the datastore layer send an IP set create
 // event before it sends a rule that references that IP set.
 type WindowsDataplane struct {
 	// the channel which we receive messages from felix
@@ -182,7 +178,7 @@ func NewWinDataplaneDriver(hns hns.API, config Config) *WindowsDataplane {
 	}
 	dp.policySets = policysets.NewPolicySets(hns, ipsc, policysets.FileReader(policysets.StaticFileName))
 
-	dp.RegisterManager(common.NewIPSetsManager(ipSetsV4, config.MaxIPSetSize))
+	dp.RegisterManager(dpsets.NewIPSetsManager("ipv4", ipSetsV4, config.MaxIPSetSize))
 	dp.RegisterManager(newPolicyManager(dp.policySets))
 	dp.endpointMgr = newEndpointManager(hns, dp.policySets)
 	dp.RegisterManager(dp.endpointMgr)

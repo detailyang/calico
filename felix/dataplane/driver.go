@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,32 +20,26 @@ import (
 	"context"
 	"math/bits"
 	"net"
-	"net/http"
 	"os/exec"
 	"runtime/debug"
-	"strconv"
 	"strings"
-	"time"
 
-	coreV1 "k8s.io/api/core/v1"
-
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	coreV1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
 
-	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	"github.com/projectcalico/calico/felix/aws"
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
+	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/felix/collector"
 	"github.com/projectcalico/calico/felix/config"
 	extdataplane "github.com/projectcalico/calico/felix/dataplane/external"
 	"github.com/projectcalico/calico/felix/dataplane/inactive"
@@ -53,19 +47,24 @@ import (
 	"github.com/projectcalico/calico/felix/idalloc"
 	"github.com/projectcalico/calico/felix/ifacemonitor"
 	"github.com/projectcalico/calico/felix/ipsets"
+	"github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/logutils"
 	"github.com/projectcalico/calico/felix/markbits"
+	"github.com/projectcalico/calico/felix/nftables"
 	"github.com/projectcalico/calico/felix/rules"
 	"github.com/projectcalico/calico/felix/wireguard"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 )
 
-func StartDataplaneDriver(configParams *config.Config,
+func StartDataplaneDriver(
+	configParams *config.Config,
 	healthAggregator *health.HealthAggregator,
+	collector collector.Collector,
 	configChangedRestartCallback func(),
 	fatalErrorCallback func(error),
-	k8sClientSet *kubernetes.Clientset) (DataplaneDriver, *exec.Cmd) {
-
+	k8sClientSet *kubernetes.Clientset,
+	lc *calc.LookupsCache,
+) (DataplaneDriver, *exec.Cmd) {
 	if !configParams.IsLeader() {
 		// Return an inactive dataplane, since we're not the leader.
 		log.Info("Not the leader, using an inactive dataplane")
@@ -89,7 +88,7 @@ func StartDataplaneDriver(configParams *config.Config,
 			log.Panic("Starting dataplane with nil callback func.")
 		}
 
-		allowedMarkBits := configParams.IptablesMarkMask
+		allowedMarkBits := configParams.MarkMask()
 		if configParams.BPFEnabled {
 			// In BPF mode, the BPF programs use mark bits that are not configurable.  Make sure that those
 			// bits are covered by our allowed mask.
@@ -98,7 +97,7 @@ func StartDataplaneDriver(configParams *config.Config,
 					"Name":            "felix-iptables",
 					"MarkMask":        allowedMarkBits,
 					"RequiredBPFBits": tcdefs.MarksMask,
-				}).Panic("IptablesMarkMask doesn't cover bits that are used (unconditionally) by eBPF mode.")
+				}).Panic("IptablesMarkMask/NftablesMarkMask doesn't cover bits that are used (unconditionally) by eBPF mode.")
 			}
 			allowedMarkBits ^= allowedMarkBits & tcdefs.MarksMask
 			log.WithField("updatedBits", allowedMarkBits).Info(
@@ -116,6 +115,8 @@ func StartDataplaneDriver(configParams *config.Config,
 
 		// The pass bit is used to communicate from a policy chain up to the endpoint chain.
 		markPass, _ = markBitsManager.NextSingleBitMark()
+
+		markDrop, _ := markBitsManager.NextSingleBitMark()
 
 		// Scratch bits are short-lived bits used for calculating multi-rule results.
 		markScratch0, _ = markBitsManager.NextSingleBitMark()
@@ -154,6 +155,7 @@ func StartDataplaneDriver(configParams *config.Config,
 		log.WithFields(log.Fields{
 			"acceptMark":          markAccept,
 			"passMark":            markPass,
+			"dropMark":            markDrop,
 			"scratch0Mark":        markScratch0,
 			"scratch1Mark":        markScratch1,
 			"endpointMark":        markEndpointMark,
@@ -215,6 +217,7 @@ func StartDataplaneDriver(configParams *config.Config,
 				NetlinkTimeout:    configParams.NetlinkTimeoutSecs,
 			},
 			RulesConfig: rules.Config{
+				NFTables:              configParams.NFTablesMode == "Enabled",
 				WorkloadIfacePrefixes: configParams.InterfacePrefixes(),
 
 				IPSetConfigV4: ipsets.NewIPVersionConfig(
@@ -237,12 +240,13 @@ func StartDataplaneDriver(configParams *config.Config,
 				OpenStackMetadataIP:          net.ParseIP(configParams.MetadataAddr),
 				OpenStackMetadataPort:        uint16(configParams.MetadataPort),
 
-				IptablesMarkAccept:          markAccept,
-				IptablesMarkPass:            markPass,
-				IptablesMarkScratch0:        markScratch0,
-				IptablesMarkScratch1:        markScratch1,
-				IptablesMarkEndpoint:        markEndpointMark,
-				IptablesMarkNonCaliEndpoint: markEndpointNonCaliEndpoint,
+				MarkAccept:          markAccept,
+				MarkPass:            markPass,
+				MarkDrop:            markDrop,
+				MarkScratch0:        markScratch0,
+				MarkScratch1:        markScratch1,
+				MarkEndpoint:        markEndpointMark,
+				MarkNonCaliEndpoint: markEndpointNonCaliEndpoint,
 
 				VXLANEnabled:   configParams.Encapsulation.VXLANEnabled,
 				VXLANEnabledV6: configParams.Encapsulation.VXLANEnabledV6,
@@ -262,17 +266,17 @@ func StartDataplaneDriver(configParams *config.Config,
 				WireguardEnabledV6:          configParams.WireguardEnabledV6,
 				WireguardInterfaceName:      configParams.WireguardInterfaceName,
 				WireguardInterfaceNameV6:    configParams.WireguardInterfaceNameV6,
-				WireguardIptablesMark:       markWireguard,
+				WireguardMark:               markWireguard,
 				WireguardListeningPort:      configParams.WireguardListeningPort,
 				WireguardListeningPortV6:    configParams.WireguardListeningPortV6,
 				WireguardEncryptHostTraffic: configParams.WireguardHostEncryptionEnabled,
 				RouteSource:                 configParams.RouteSource,
 
-				IptablesLogPrefix:         configParams.LogPrefix,
-				EndpointToHostAction:      configParams.DefaultEndpointToHostAction,
-				IptablesFilterAllowAction: configParams.IptablesFilterAllowAction,
-				IptablesMangleAllowAction: configParams.IptablesMangleAllowAction,
-				IptablesFilterDenyAction:  configParams.IptablesFilterDenyAction,
+				LogPrefix:            configParams.LogPrefix,
+				EndpointToHostAction: configParams.DefaultEndpointToHostAction,
+				FilterAllowAction:    configParams.FilterAllowAction(),
+				MangleAllowAction:    configParams.MangleAllowAction(),
+				FilterDenyAction:     configParams.FilterDenyAction(),
 
 				FailsafeInboundHostPorts:  configParams.FailsafeInboundHostPorts,
 				FailsafeOutboundHostPorts: configParams.FailsafeOutboundHostPorts,
@@ -283,7 +287,7 @@ func StartDataplaneDriver(configParams *config.Config,
 				IptablesNATOutgoingInterfaceFilter: configParams.IptablesNATOutgoingInterfaceFilter,
 				NATOutgoingAddress:                 configParams.NATOutgoingAddress,
 				BPFEnabled:                         configParams.BPFEnabled,
-				BPFForceTrackPacketsFromIfaces:     configParams.BPFForceTrackPacketsFromIfaces,
+				BPFForceTrackPacketsFromIfaces:     replaceWildcards(configParams.NFTablesMode == "Enabled", configParams.BPFForceTrackPacketsFromIfaces),
 				ServiceLoopPrevention:              configParams.ServiceLoopPrevention,
 			},
 			Wireguard: wireguard.Config{
@@ -302,6 +306,7 @@ func StartDataplaneDriver(configParams *config.Config,
 				RouteSource:         configParams.RouteSource,
 				EncryptHostTraffic:  configParams.WireguardHostEncryptionEnabled,
 				PersistentKeepAlive: configParams.WireguardPersistentKeepAlive,
+				ThreadedNAPI:        configParams.WireguardThreadingEnabled,
 				RouteSyncDisabled:   configParams.RouteSyncDisabled,
 			},
 			IPIPMTU:                        configParams.IpInIpMtu,
@@ -309,13 +314,14 @@ func StartDataplaneDriver(configParams *config.Config,
 			VXLANMTUV6:                     configParams.VXLANMTUV6,
 			VXLANPort:                      configParams.VXLANPort,
 			IptablesBackend:                configParams.IptablesBackend,
-			IptablesRefreshInterval:        configParams.IptablesRefreshInterval,
+			TableRefreshInterval:           configParams.TableRefreshInterval(),
 			RouteSyncDisabled:              configParams.RouteSyncDisabled,
 			RouteRefreshInterval:           configParams.RouteRefreshInterval,
 			DeviceRouteSourceAddress:       configParams.DeviceRouteSourceAddress,
 			DeviceRouteSourceAddressIPv6:   configParams.DeviceRouteSourceAddressIPv6,
 			DeviceRouteProtocol:            netlink.RouteProtocol(configParams.DeviceRouteProtocol),
 			RemoveExternalRoutes:           configParams.RemoveExternalRoutes,
+			IPForwarding:                   configParams.IPForwarding,
 			IPSetsRefreshInterval:          configParams.IpsetsRefreshInterval,
 			IptablesPostWriteCheckInterval: configParams.IptablesPostWriteCheckIntervalSecs,
 			IptablesInsertMode:             configParams.ChainInsertMode,
@@ -324,7 +330,7 @@ func StartDataplaneDriver(configParams *config.Config,
 			IptablesLockProbeInterval:      configParams.IptablesLockProbeIntervalMillis,
 			MaxIPSetSize:                   configParams.MaxIpsetSize,
 			IPv6Enabled:                    configParams.Ipv6Support,
-			BPFIpv6Enabled:                 configParams.BpfIpv6Support,
+			BPFIpv6Enabled:                 configParams.Ipv6Support && configParams.BPFEnabled,
 			BPFHostConntrackBypass:         configParams.BPFHostConntrackBypass,
 			StatusReportingInterval:        configParams.ReportingIntervalSecs,
 			XDPRefreshInterval:             configParams.XDPRefreshInterval,
@@ -347,14 +353,18 @@ func StartDataplaneDriver(configParams *config.Config,
 			HealthAggregator:                   healthAggregator,
 			WatchdogTimeout:                    configParams.DataplaneWatchdogTimeout,
 			DebugSimulateDataplaneHangAfter:    configParams.DebugSimulateDataplaneHangAfter,
+			DebugSimulateDataplaneApplyDelay:   configParams.DebugSimulateDataplaneApplyDelay,
 			ExternalNodesCidrs:                 configParams.ExternalNodesCIDRList,
 			SidecarAccelerationEnabled:         configParams.SidecarAccelerationEnabled,
 			BPFEnabled:                         configParams.BPFEnabled,
 			BPFPolicyDebugEnabled:              configParams.BPFPolicyDebugEnabled,
 			BPFDisableUnprivileged:             configParams.BPFDisableUnprivileged,
 			BPFConnTimeLBEnabled:               configParams.BPFConnectTimeLoadBalancingEnabled,
+			BPFConnTimeLB:                      configParams.BPFConnectTimeLoadBalancing,
+			BPFHostNetworkedNAT:                configParams.BPFHostNetworkedNATWithoutCTLB,
 			BPFKubeProxyIptablesCleanupEnabled: configParams.BPFKubeProxyIptablesCleanupEnabled,
 			BPFLogLevel:                        configParams.BPFLogLevel,
+			BPFConntrackLogLevel:               configParams.BPFConntrackLogLevel,
 			BPFLogFilters:                      configParams.BPFLogFilters,
 			BPFCTLBLogFilter:                   configParams.BPFCTLBLogFilter,
 			BPFExtToServiceConnmark:            configParams.BPFExtToServiceConnmark,
@@ -369,15 +379,24 @@ func StartDataplaneDriver(configParams *config.Config,
 			BPFMapSizeNATBackend:               configParams.BPFMapSizeNATBackend,
 			BPFMapSizeNATAffinity:              configParams.BPFMapSizeNATAffinity,
 			BPFMapSizeConntrack:                configParams.BPFMapSizeConntrack,
+			BPFMapSizePerCPUConntrack:          configParams.BPFMapSizePerCPUConntrack,
+			BPFMapSizeConntrackCleanupQueue:    configParams.BPFMapSizeConntrackCleanupQueue,
 			BPFMapSizeIPSets:                   configParams.BPFMapSizeIPSets,
 			BPFMapSizeIfState:                  configParams.BPFMapSizeIfState,
 			BPFEnforceRPF:                      configParams.BPFEnforceRPF,
 			BPFDisableGROForIfaces:             configParams.BPFDisableGROForIfaces,
+			BPFExportBufferSizeMB:              configParams.BPFExportBufferSizeMB,
 			XDPEnabled:                         configParams.XDPEnabled,
 			XDPAllowGeneric:                    configParams.GenericXDPEnabled,
-			BPFConntrackTimeouts:               conntrack.DefaultTimeouts(), // FIXME make timeouts configurable
+			BPFConntrackTimeouts:               conntrack.GetTimeouts(configParams.BPFConntrackTimeouts),
+			BPFConntrackCleanupMode:            apiv3.BPFConntrackMode(configParams.BPFConntrackCleanupMode),
 			RouteTableManager:                  routeTableIndexAllocator,
 			MTUIfacePattern:                    configParams.MTUIfacePattern,
+			BPFExcludeCIDRsFromNAT:             configParams.BPFExcludeCIDRsFromNAT,
+			NfNetlinkBufSize:                   configParams.NfNetlinkBufSize,
+			BPFRedirectToPeer:                  configParams.BPFRedirectToPeer,
+			BPFProfiling:                       configParams.BPFProfiling,
+			ServiceLoopPrevention:              configParams.ServiceLoopPrevention,
 
 			KubeClientSet: k8sClientSet,
 
@@ -387,6 +406,8 @@ func StartDataplaneDriver(configParams *config.Config,
 			RouteSource: configParams.RouteSource,
 
 			KubernetesProvider: configParams.KubernetesProvider(),
+			Collector:          collector,
+			LookupsCache:       lc,
 		}
 
 		if configParams.BPFExternalServiceMode == "dsr" {
@@ -398,10 +419,11 @@ func StartDataplaneDriver(configParams *config.Config,
 		intDP.Start()
 
 		// Set source-destination-check on AWS EC2 instance.
-		if configParams.AWSSrcDstCheck != string(apiv3.AWSSrcDstCheckOptionDoNothing) {
+		check := apiv3.AWSSrcDstCheckOption(configParams.AWSSrcDstCheck)
+		if check != apiv3.AWSSrcDstCheckOptionDoNothing {
 			c := &clock.RealClock{}
 			updater := aws.NewEC2SrcDstCheckUpdater()
-			go aws.WaitForEC2SrcDstCheckUpdate(configParams.AWSSrcDstCheck, healthAggregator, updater, c)
+			go aws.WaitForEC2SrcDstCheckUpdate(check, healthAggregator, updater, c)
 		}
 
 		return intDP, nil
@@ -417,11 +439,7 @@ func SupportsBPF() error {
 	return bpf.SupportsBPFDataplane()
 }
 
-func ServePrometheusMetrics(configParams *config.Config) {
-	log.WithFields(log.Fields{
-		"host": configParams.PrometheusMetricsHost,
-		"port": configParams.PrometheusMetricsPort,
-	}).Info("Starting prometheus metrics endpoint")
+func ConfigurePrometheusMetrics(configParams *config.Config) {
 	if configParams.PrometheusGoMetricsEnabled && configParams.PrometheusProcessMetricsEnabled && configParams.PrometheusWireGuardMetricsEnabled {
 		log.Info("Including Golang, Process and WireGuard metrics")
 	} else {
@@ -438,12 +456,19 @@ func ServePrometheusMetrics(configParams *config.Config) {
 			prometheus.Unregister(wireguard.MustNewWireguardMetrics())
 		}
 	}
-	http.Handle("/metrics", promhttp.Handler())
-	addr := net.JoinHostPort(configParams.PrometheusMetricsHost, strconv.Itoa(configParams.PrometheusMetricsPort))
-	for {
-		err := http.ListenAndServe(addr, nil)
-		log.WithError(err).Error(
-			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1 * time.Second)
+}
+
+func replaceWildcards(nftEnabled bool, s []string) []string {
+	for i, v := range s {
+		s[i] = replaceWildcard(nftEnabled, v)
 	}
+	return s
+}
+
+func replaceWildcard(nftEnabled bool, s string) string {
+	// Need to replace the "+" wildcard with "*" for nftables.
+	if nftEnabled && strings.HasSuffix(s, iptables.Wildcard) {
+		return s[:len(s)-1] + nftables.Wildcard
+	}
+	return s
 }

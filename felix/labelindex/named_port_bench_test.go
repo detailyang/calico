@@ -20,12 +20,10 @@ import (
 	"runtime"
 	"testing"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
 
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
 	. "github.com/projectcalico/calico/felix/labelindex"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	calinet "github.com/projectcalico/calico/libcalico-go/lib/net"
@@ -35,12 +33,15 @@ import (
 func BenchmarkWorkloadUpdate10Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 10)
 }
+
 func BenchmarkWorkloadUpdate100Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 100)
 }
+
 func BenchmarkWorkloadUpdate1000Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 1000)
 }
+
 func BenchmarkWorkloadUpdate10000Sels(b *testing.B) {
 	benchmarkWorkloadUpdates(b, 10000)
 }
@@ -53,7 +54,7 @@ func benchmarkWorkloadUpdates(b *testing.B, numSels int) {
 	logrus.SetLevel(logrus.InfoLevel)
 	defer logrus.SetLevel(logLevel)
 
-	idx := NewSelectorAndNamedPortIndex()
+	idx := NewSelectorAndNamedPortIndex(false)
 	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
 		lastID = ipSetID
 		lastMember = member
@@ -63,22 +64,27 @@ func benchmarkWorkloadUpdates(b *testing.B, numSels int) {
 		lastMember = member
 	}
 	for i := 0; i < numSels; i++ {
-		sel, err := selector.Parse(fmt.Sprintf(`alpha == "beta" || has(ipset-%d)`, i))
+		sel, err := selector.Parse(fmt.Sprintf(`alpha == "beta" && has(ipset-%d)`, i))
 		if err != nil {
 			b.Fatal(err)
 		}
+		_ = sel.String() // So it caches the string.
 		idx.UpdateIPSet(fmt.Sprintf("ipset-%d", i), sel, ProtocolNone, "")
 	}
 
 	updates := makeEndpointUpdates(b.N)
 
 	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		idx.OnUpdate(updates[n])
-	}
+	sendUpdates(b, idx, updates)
 
 	runtime.KeepAlive(lastID)
 	runtime.KeepAlive(lastMember)
+}
+
+func sendUpdates(b *testing.B, idx *SelectorAndNamedPortIndex, updates []api.Update) {
+	for n := 0; n < b.N; n++ {
+		idx.OnUpdate(updates[n])
+	}
 }
 
 func makeEndpointUpdates(num int) []api.Update {
@@ -98,7 +104,7 @@ func makeEndpointUpdates(num int) []api.Update {
 			KVPair: model.KVPair{
 				Key: key,
 				Value: &model.WorkloadEndpoint{
-					Labels:     map[string]string{"alpha": "beta"},
+					Labels:     map[string]string{"alpha": "beta", "ipset-1": "true"},
 					IPv4Nets:   []calinet.IPNet{ipNet},
 					ProfileIDs: []string{fmt.Sprintf("namespace-%d", n)},
 				},
@@ -132,7 +138,7 @@ func benchmarkParentUpdates(b *testing.B, numSels, numEndpoints int) {
 	logrus.SetLevel(logrus.InfoLevel)
 	defer logrus.SetLevel(logLevel)
 
-	idx := NewSelectorAndNamedPortIndex()
+	idx := NewSelectorAndNamedPortIndex(false)
 	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
 		lastID = ipSetID
 		lastMember = member
@@ -179,6 +185,65 @@ func benchmarkParentUpdates(b *testing.B, numSels, numEndpoints int) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		idx.OnUpdate(updates[n])
+	}
+
+	runtime.KeepAlive(lastID)
+	runtime.KeepAlive(lastMember)
+}
+
+func BenchmarkSelectorUpdates100(b *testing.B) {
+	benchmarkSelectorUpdates(b, 100)
+}
+
+func BenchmarkSelectorUpdates1000(b *testing.B) {
+	benchmarkSelectorUpdates(b, 1000)
+}
+
+func BenchmarkSelectorUpdates10000(b *testing.B) {
+	benchmarkSelectorUpdates(b, 10000)
+}
+
+func BenchmarkSelectorUpdates100000(b *testing.B) {
+	benchmarkSelectorUpdates(b, 100000)
+}
+
+func benchmarkSelectorUpdates(b *testing.B, numEndpoints int) {
+	var lastID string
+	var lastMember IPSetMember
+
+	logLevel := logrus.GetLevel()
+	logrus.SetLevel(logrus.InfoLevel)
+	defer logrus.SetLevel(logLevel)
+
+	idx := NewSelectorAndNamedPortIndex(false)
+	idx.OnMemberAdded = func(ipSetID string, member IPSetMember) {
+		lastID = ipSetID
+		lastMember = member
+	}
+	idx.OnMemberRemoved = func(ipSetID string, member IPSetMember) {
+		lastID = ipSetID
+		lastMember = member
+	}
+
+	// Create the endpoints first.
+	updates := makeEndpointUpdates(numEndpoints)
+	for _, upd := range updates {
+		idx.OnUpdate(upd)
+	}
+
+	// Pre-calculate the selectors.
+	var sels []selector.Selector
+	for i := 0; i < b.N; i++ {
+		sel, err := selector.Parse(fmt.Sprintf(`alpha == "beta" && has(ipset-%d)`, i%10))
+		if err != nil {
+			b.Fatal(err)
+		}
+		sels = append(sels, sel)
+	}
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		idx.UpdateIPSet(fmt.Sprintf("ipset-%d", n), sels[n], ProtocolNone, "")
 	}
 
 	runtime.KeepAlive(lastID)

@@ -23,12 +23,10 @@ import (
 	"time"
 
 	"github.com/containernetworking/plugins/plugins/ipam/host-local/backend/disk"
-	log "github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	corev1 "k8s.io/api/core/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/cni-plugin/internal/pkg/utils"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -63,9 +61,9 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 
 	// Check to see if the system is still using host-local
 	// by checking the existence of the path.
-	log.Info("checking host-local IPAM data dir dir existence...")
+	log.Info("checking host-local IPAM data dir existence...")
 	if _, err := os.Stat(ipAllocPath); err != nil && os.IsNotExist(err) {
-		log.Info("host-local IPAM data dir dir not found; no migration necessary, successfully exiting...")
+		log.Info("host-local IPAM data dir not found; no migration necessary, successfully exiting...")
 		return nil
 	}
 
@@ -146,7 +144,7 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 	}
 
 	// Open k8s-pod-directory to check for emptiness.
-	log.Info("checking if host-local IPAM data dir dir is empty...")
+	log.Info("checking if host-local IPAM data dir is empty...")
 	ipamDir, err := os.Open(ipAllocPath)
 	if err != nil {
 		return fmt.Errorf("failed to open host-local IPAM data dir dir: %s", err)

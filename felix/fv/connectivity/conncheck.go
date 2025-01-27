@@ -148,8 +148,9 @@ func (c *Checker) expect(expected Expected, from ConnectionSource, to Connection
 	}
 
 	e := Expectation{
-		From:     from,
-		Expected: expected,
+		From:      from,
+		Expected:  expected,
+		ipVersion: 4,
 	}
 
 	if expected {
@@ -217,7 +218,7 @@ func (c *Checker) ActualConnectivity(isARetry bool) ([]*Result, []string) {
 			go func(i int, exp Expectation) {
 				defer ginkgo.GinkgoRecover()
 				defer wg.Done()
-				exp.From.PreRetryCleanup(exp.To.IP, exp.To.Port, p, preCalcOpts[i]...)
+				exp.From.PreRetryCleanup(exp.DestIP(), exp.To.Port, p, preCalcOpts[i]...)
 			}(i, exp)
 		}
 		wg.Wait()
@@ -229,12 +230,17 @@ func (c *Checker) ActualConnectivity(isARetry bool) ([]*Result, []string) {
 		go func(i int, exp Expectation) {
 			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
-			res := exp.From.CanConnectTo(exp.To.IP, exp.To.Port, p, preCalcOpts[i]...)
+			res := exp.From.CanConnectTo(exp.DestIP(), exp.To.Port, p, preCalcOpts[i]...)
 			pretty[i] += fmt.Sprintf("%s -> %s = %v", exp.From.SourceName(), exp.To.TargetName, res.HasConnectivity())
 
 			if res != nil {
 				if c.CheckSNAT {
-					srcIP := strings.Split(res.LastResponse.SourceAddr, ":")[0]
+					var srcIP string
+					if res.LastResponse.SourceAddr != "" && res.LastResponse.SourceAddr[0] == '[' {
+						srcIP = strings.Split(res.LastResponse.SourceAddr[1:], "]")[0]
+					} else {
+						srcIP = strings.Split(res.LastResponse.SourceAddr, ":")[0]
+					}
 					pretty[i] += " (from " + srcIP + ")"
 				}
 				if res.ClientMTU.Start != 0 {
@@ -269,6 +275,9 @@ func (c *Checker) ExpectedConnectivityPretty() []string {
 			if exp.clientMTUStart != 0 || exp.clientMTUEnd != 0 {
 				result[i] += fmt.Sprintf(" (client MTU %d -> %d)", exp.clientMTUStart, exp.clientMTUEnd)
 			}
+		}
+		if exp.ipVersion == 6 {
+			result[i] += " (with IPv6)"
 		}
 		if exp.ExpectedPacketLoss.Duration > 0 {
 			if exp.ExpectedPacketLoss.MaxNumber >= 0 {
@@ -439,7 +448,11 @@ type Response struct {
 }
 
 func (r *Response) SourceIP() string {
-	return strings.Split(r.SourceAddr, ":")[0]
+	if r.SourceAddr[0] != '[' {
+		return strings.Split(r.SourceAddr, ":")[0]
+	}
+
+	return strings.Split(r.SourceAddr[1:], "]")[0]
 }
 
 type ConnectionTarget interface {
@@ -472,7 +485,7 @@ func HaveConnectivityTo(target ConnectionTarget, explicitPort ...uint16) types.G
 }
 
 type Matcher struct {
-	IP, Port, TargetName, Protocol string
+	IP, Port, TargetName, Protocol, IP6 string
 }
 
 type ConnectionSource interface {
@@ -569,6 +582,12 @@ func ExpectWithPorts(ports ...uint16) ExpectationOption {
 	}
 }
 
+func ExpectWithIPVersion(ipVersion int) ExpectationOption {
+	return func(e *Expectation) {
+		e.ipVersion = ipVersion
+	}
+}
+
 type Expectation struct {
 	From               ConnectionSource // Workload or Container
 	To                 *Matcher         // Workload or IP, + port
@@ -587,12 +606,21 @@ type Expectation struct {
 	srcPort uint16
 
 	ErrorStr string
+
+	ipVersion int
 }
 
 type ExpPacketLoss struct {
 	Duration   time.Duration // how long test will run
 	MaxPercent float64       // 10 means 10%. -1 means field not valid.
 	MaxNumber  int           // 10 means 10 packets. -1 means field not valid.
+}
+
+func (e Expectation) DestIP() string {
+	if e.ipVersion == 6 {
+		return e.To.IP6
+	}
+	return e.To.IP
 }
 
 func (e Expectation) Matches(response *Result, checkSNAT bool) bool {

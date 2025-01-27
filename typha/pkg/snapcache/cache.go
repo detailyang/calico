@@ -26,13 +26,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/projectcalico/calico/typha/pkg/promutils"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
 	cprometheus "github.com/projectcalico/calico/libcalico-go/lib/prometheus"
-
 	"github.com/projectcalico/calico/typha/pkg/jitter"
+	"github.com/projectcalico/calico/typha/pkg/promutils"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
 )
 
@@ -342,6 +340,9 @@ func (c *Cache) fillBatchFromInputQueue(ctx context.Context) error {
 			log.Debug("Waking all clients.")
 			c.breadcrumbCond.Broadcast()
 			c.lastBroadcast = time.Now()
+			// If there are no updates, we want the Prometheus stat to decay
+			// to zero.
+			c.summaryUpdateSize.Observe(0)
 		case <-c.healthTicks:
 			c.reportHealth()
 		}
@@ -445,12 +446,15 @@ func (c *Cache) publishBreadcrumb() {
 		somethingChanged = true
 	}
 
+	// Even if all updates were filtered out, report that to Prometheus; we
+	// want the stat to decay to zero if the event stream is quiet.
+	c.summaryUpdateSize.Observe(float64(len(newCrumb.Deltas)))
+
 	if !somethingChanged {
 		log.Debug("Skipping Breadcrumb.  No updates to publish.")
 		return
 	}
 
-	c.summaryUpdateSize.Observe(float64(len(newCrumb.Deltas)))
 	c.gaugeSnapSize.Set(float64(c.kvs.Len()))
 	// Add the new read-only snapshot to the new crumb.
 	newCrumb.KVs = c.kvs.Clone()

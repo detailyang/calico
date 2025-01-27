@@ -1,4 +1,4 @@
-// Copyright (c) 2018,2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2018-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,11 +25,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/projectcalico/calico/confd/pkg/resource/template"
+	"github.com/projectcalico/calico/libcalico-go/lib/winutils"
 )
 
 const (
@@ -44,7 +43,7 @@ type routeGenerator struct {
 	client                     *client
 	nodeName                   string
 	svcInformer, epInformer    cache.Controller
-	svcIndexer, epIndexer      cache.Indexer
+	svcIndexer, epIndexer      cache.Store
 	svcRouteMap                map[string]map[string]bool
 	routeAdvertisementRefCount map[string]int
 	resyncKnownRoutesTrigger   chan struct{}
@@ -73,11 +72,11 @@ func NewRouteGenerator(c *client) (rg *routeGenerator, err error) {
 	// set up k8s client
 	// attempt 1: KUBECONFIG env var
 	cfgFile := os.Getenv("KUBECONFIG")
-	cfg, err := clientcmd.BuildConfigFromFlags("", cfgFile)
+	cfg, err := winutils.BuildConfigFromFlags("", cfgFile)
 	if err != nil {
 		log.WithError(err).Info("KUBECONFIG environment variable not found, attempting in-cluster")
 		// attempt 2: in cluster config
-		if cfg, err = rest.InClusterConfig(); err != nil {
+		if cfg, err = winutils.GetInClusterConfig(); err != nil {
 			return
 		}
 	}
@@ -89,12 +88,24 @@ func NewRouteGenerator(c *client) (rg *routeGenerator, err error) {
 	// set up services informer
 	svcWatcher := cache.NewListWatchFromClient(client.CoreV1().RESTClient(), "services", "", fields.Everything())
 	svcHandler := cache.ResourceEventHandlerFuncs{AddFunc: rg.onSvcAdd, UpdateFunc: rg.onSvcUpdate, DeleteFunc: rg.onSvcDelete}
-	rg.svcIndexer, rg.svcInformer = cache.NewIndexerInformer(svcWatcher, &v1.Service{}, 0, svcHandler, cache.Indexers{})
+	rg.svcIndexer, rg.svcInformer = cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: svcWatcher,
+		ObjectType:    &v1.Service{},
+		ResyncPeriod:  0,
+		Handler:       svcHandler,
+		Indexers:      cache.Indexers{},
+	})
 
 	// set up endpoints informer
 	epWatcher := cache.NewListWatchFromClient(client.CoreV1().RESTClient(), "endpoints", "", fields.Everything())
 	epHandler := cache.ResourceEventHandlerFuncs{AddFunc: rg.onEPAdd, UpdateFunc: rg.onEPUpdate, DeleteFunc: rg.onEPDelete}
-	rg.epIndexer, rg.epInformer = cache.NewIndexerInformer(epWatcher, &v1.Endpoints{}, 0, epHandler, cache.Indexers{})
+	rg.epIndexer, rg.epInformer = cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: epWatcher,
+		ObjectType:    &v1.Endpoints{},
+		ResyncPeriod:  0,
+		Handler:       epHandler,
+		Indexers:      cache.Indexers{},
+	})
 
 	return
 }
@@ -254,7 +265,7 @@ func (rg *routeGenerator) getAllRoutesForService(svc *v1.Service) []string {
 			if len(lbIngress.IP) > 0 {
 				// Only advertise allowed LB IPs
 				if !rg.isAllowedLoadBalancerIP(lbIngress.IP) {
-					log.WithFields(log.Fields{"ip": lbIngress.IP, "svc": svcID}).Info("Cannot advertise LoadBalancer IP - not not in allow list")
+					log.WithFields(log.Fields{"ip": lbIngress.IP, "svc": svcID}).Info("Cannot advertise LoadBalancer IP - not in allow list")
 					continue
 				}
 				routes = append(routes, lbIngress.IP)
@@ -309,6 +320,10 @@ func (rg *routeGenerator) setRoutesForKey(key string, routes []string) {
 // isAllowedExternalIP determines if the given IP is in the list of
 // allowed External IP CIDRs given in the default bgpconfiguration.
 func (rg *routeGenerator) isAllowedExternalIP(externalIP string) bool {
+	if externalIP == "" {
+		log.Debug("Skip empty service External IP")
+		return false
+	}
 	ip := net.ParseIP(externalIP)
 	if ip == nil {
 		log.Errorf("Could not parse service External IP: %s", externalIP)
@@ -328,6 +343,10 @@ func (rg *routeGenerator) isAllowedExternalIP(externalIP string) bool {
 // isAllowedLoadBalancerIP determines if the given IP is in the list of
 // allowed LoadBalancer CIDRs given in the default bgpconfiguration.
 func (rg *routeGenerator) isAllowedLoadBalancerIP(loadBalancerIP string) bool {
+	if loadBalancerIP == "" {
+		log.Debug("Skip empty service LB IP")
+		return false
+	}
 	ip := net.ParseIP(loadBalancerIP)
 	if ip == nil {
 		log.Errorf("Could not parse service LB IP: %s", loadBalancerIP)
@@ -348,7 +367,10 @@ func (rg *routeGenerator) isAllowedLoadBalancerIP(loadBalancerIP string) bool {
 // allowed LoadBalancer CIDRs given in the default bgpconfiguration
 // and is a single IP entry (/32 for IPV4 or /128 for IPV6)
 func (rg *routeGenerator) isSingleLoadBalancerIP(loadBalancerIP string) bool {
-
+	if loadBalancerIP == "" {
+		log.Debug("Skip empty service LB IP")
+		return false
+	}
 	ip := net.ParseIP(loadBalancerIP)
 	if ip == nil {
 		log.Errorf("Could not parse service LB IP: %s", loadBalancerIP)
@@ -356,6 +378,32 @@ func (rg *routeGenerator) isSingleLoadBalancerIP(loadBalancerIP string) bool {
 	}
 
 	for _, allowedNet := range rg.client.GetLoadBalancerIPs() {
+		if allowedNet.Contains(ip) {
+			if ones, bits := allowedNet.Mask.Size(); ones == bits {
+				return true
+			}
+		}
+	}
+
+	// Guilty until proven innocent
+	return false
+}
+
+// isSingleExternalIP determines if the given IP is in the list of
+// allowed ExternalIP CIDRs given in the default bgpconfiguration
+// and is a single IP entry (/32 for IPV4 or /128 for IPV6)
+func (rg *routeGenerator) isSingleExternalIP(externalIP string) bool {
+	if externalIP == "" {
+		log.Debug("Skip empty service External IP")
+		return false
+	}
+	ip := net.ParseIP(externalIP)
+	if ip == nil {
+		log.Errorf("Could not parse service External IP: %s", externalIP)
+		return false
+	}
+
+	for _, allowedNet := range rg.client.GetExternalIPs() {
 		if allowedNet.Contains(ip) {
 			if ones, bits := allowedNet.Mask.Size(); ones == bits {
 				return true
@@ -413,10 +461,24 @@ func (rg *routeGenerator) advertiseThisService(svc *v1.Service, ep *v1.Endpoints
 		return false
 	}
 
-	// we need to announce single IPs for services of type LoadBalancer and externalTrafficPolicy Cluster
-	if svc.Spec.Type == v1.ServiceTypeLoadBalancer && svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeCluster && rg.isSingleLoadBalancerIP(svc.Spec.LoadBalancerIP) {
-		logc.Debug("Advertising load balancer of type cluster because of single IP definition")
-		return true
+	// we need to announce single IPs for services of type externalTrafficPolicy Cluster.
+	// There are 2 cases inside this type:
+	// - LoadBalancer with a single IP.
+	// - Any one of externalIPs in service of type LoadBalancer or NodePort with a single IP.
+	if svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeCluster {
+		if svc.Spec.Type == v1.ServiceTypeLoadBalancer && rg.isSingleLoadBalancerIP(svc.Spec.LoadBalancerIP) {
+			logc.Debug("Advertising load balancer of type cluster because of single IP definition")
+			return true
+		}
+
+		if svc.Spec.Type == v1.ServiceTypeLoadBalancer || svc.Spec.Type == v1.ServiceTypeNodePort {
+			for _, extIP := range svc.Spec.ExternalIPs {
+				if rg.isSingleExternalIP(extIP) {
+					logc.Debug("Advertising external IP of type cluster because of single IP definition")
+					return true
+				}
+			}
+		}
 	}
 
 	// we only need to advertise local services, since we advertise the entire cluster IP range.

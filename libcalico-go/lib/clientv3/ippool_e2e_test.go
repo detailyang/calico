@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,9 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
@@ -46,13 +45,15 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 	name1 := "ippool-1"
 	name2 := "ippool-2"
 	name3 := "ippool-3"
+	automatic := apiv3.Automatic
 	spec1 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		IPIPMode:     apiv3.IPIPModeAlways,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		IPIPMode:       apiv3.IPIPModeAlways,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	spec1_2 := apiv3.IPPoolSpec{
 		CIDR:             "1.2.3.0/24",
@@ -63,6 +64,7 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 		NodeSelector:     `foo == "bar"`,
 		AllowedUses:      []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
 		DisableBGPExport: true,
+		AssignmentMode:   &automatic,
 	}
 	spec2 := apiv3.IPPoolSpec{
 		CIDR:             "2001::/120",
@@ -73,6 +75,7 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 		NodeSelector:     "all()",
 		AllowedUses:      []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
 		DisableBGPExport: true,
+		AssignmentMode:   &automatic,
 	}
 	spec2_1 := apiv3.IPPoolSpec{
 		CIDR:             "2001::/120",
@@ -82,22 +85,25 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 		NodeSelector:     "all()",
 		AllowedUses:      []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
 		DisableBGPExport: false,
+		AssignmentMode:   &automatic,
 	}
 	spec3 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		IPIPMode:     "",
-		VXLANMode:    "",
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		IPIPMode:       "",
+		VXLANMode:      "",
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 	spec3_1 := apiv3.IPPoolSpec{
-		CIDR:         "1.2.3.0/24",
-		IPIPMode:     apiv3.IPIPModeNever,
-		VXLANMode:    apiv3.VXLANModeNever,
-		BlockSize:    26,
-		NodeSelector: "all()",
-		AllowedUses:  []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		CIDR:           "1.2.3.0/24",
+		IPIPMode:       apiv3.IPIPModeNever,
+		VXLANMode:      apiv3.VXLANModeNever,
+		BlockSize:      26,
+		NodeSelector:   "all()",
+		AllowedUses:    []apiv3.IPPoolAllowedUse{apiv3.IPPoolAllowedUseWorkload, apiv3.IPPoolAllowedUseTunnel},
+		AssignmentMode: &automatic,
 	}
 
 	It("should error when creating an IPPool with no name", func() {
@@ -124,7 +130,7 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 
 			By("Updating the IPPool before it is created")
 			_, outError := c.IPPools().Update(ctx, &apiv3.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-ippool"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -211,7 +217,7 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 
 			By("Attempting to update the IPPool without a Creation Timestamp")
 			res, outError = c.IPPools().Update(ctx, &apiv3.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: "test-fail-ippool"},
+				ObjectMeta: metav1.ObjectMeta{Name: name1, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -596,17 +602,17 @@ var _ = testutils.E2eDatastoreDescribe("IPPool tests", testutils.DatastoreAll, f
 		}
 
 		It("should create/update an IPPool when VXLAN is missing", func() {
-			// create an ipppol with missing vxlan
+			// create an ippool with missing vxlan
 			ipPoolV1 := missingVxlanPool.DeepCopy()
 			ipPoolV2, err := c.IPPools().Create(ctx, ipPoolV1, options.SetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			// update an ipppol with missing vxlan
+			// update an ippool with missing vxlan
 			ipPoolV2.Spec.VXLANMode = ""
 			_, err = c.IPPools().Update(ctx, ipPoolV2, options.SetOptions{})
 			Expect(err).NotTo(HaveOccurred())
 
-			// delete the ipppol
+			// delete the ippool
 			_, err = c.IPPools().Delete(ctx, ipPoolV2.Name, options.DeleteOptions{})
 			Expect(err).NotTo(HaveOccurred())
 		})

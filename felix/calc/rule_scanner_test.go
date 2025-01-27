@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,15 +20,13 @@ import (
 	"sort"
 	"strings"
 
-	. "github.com/projectcalico/calico/felix/calc"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-
 	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
 
+	. "github.com/projectcalico/calico/felix/calc"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	"github.com/projectcalico/calico/libcalico-go/lib/hash"
@@ -94,13 +92,15 @@ var _ = DescribeTable("RuleScanner rule conversion should generate correct Parse
 			Namespace:     "namespace",
 			InboundRules:  []model.Rule{modelRule},
 			OutboundRules: []model.Rule{},
+			Selector:      "a  ==  'A' ",
 		}
 		rs.OnPolicyActive(policyKey, policy)
 		Expect(ur.activeRules).To(Equal(map[model.Key]*ParsedRules{
 			policyKey: {
-				Namespace:     "namespace",
-				InboundRules:  []*ParsedRule{&expectedParsedRule},
-				OutboundRules: []*ParsedRule{},
+				Namespace:        "namespace",
+				InboundRules:     []*ParsedRule{&expectedParsedRule},
+				OutboundRules:    []*ParsedRule{},
+				OriginalSelector: "a == \"A\"",
 			},
 		}))
 		rs.OnPolicyInactive(policyKey)
@@ -281,6 +281,12 @@ var _ = Describe("ParsedRule", func() {
 			}
 			if strings.Contains(name, "ruleid") {
 				// RuleId only in proto rule.
+				continue
+			}
+			if strings.Contains(name, "state") ||
+				strings.Contains(name, "unknownfields") ||
+				strings.Contains(name, "sizecache") {
+				// protobuf fields.
 				continue
 			}
 			protoFields = append(protoFields, name)

@@ -26,10 +26,9 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/bpfutils"
 )
 
-// #cgo CFLAGS: -I${SRCDIR}/../../bpf-gpl/include/libbpf/src -I${SRCDIR}/../../bpf-gpl
-// #cgo amd64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/include/libbpf/src/amd64 -lbpf -lelf -lz
-// #cgo arm64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/include/libbpf/src/arm64 -lbpf -lelf -lz
-// #cgo armv7 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/include/libbpf/src/armv7 -lbpf -lelf -lz
+// #cgo CFLAGS: -I${SRCDIR}/../../bpf-gpl/libbpf/src -I${SRCDIR}/../../bpf-gpl/libbpf/include/uapi -I${SRCDIR}/../../bpf-gpl -Werror
+// #cgo amd64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/amd64 -lbpf -lelf -lz
+// #cgo arm64 LDFLAGS: -L${SRCDIR}/../../bpf-gpl/libbpf/src/arm64 -lbpf -lelf -lz
 // #include "libbpf_api.h"
 import "C"
 
@@ -64,6 +63,10 @@ func (m *Map) Type() int {
 
 func (m *Map) ValueSize() int {
 	return int(C.bpf_map__value_size(m.bpfMap))
+}
+
+func (m *Map) KeySize() int {
+	return int(C.bpf_map__key_size(m.bpfMap))
 }
 
 func (m *Map) SetPinPath(path string) error {
@@ -119,7 +122,7 @@ func (o *Obj) Load() error {
 // FirstMap returns first bpf map of the object.
 // Returns error if the map is nil.
 func (o *Obj) FirstMap() (*Map, error) {
-	bpfMap, err := C.bpf_map__next(nil, o.obj)
+	bpfMap, err := C.bpf_object__next_map(o.obj, nil)
 	if bpfMap == nil || err != nil {
 		return nil, fmt.Errorf("error getting first map %w", err)
 	}
@@ -129,7 +132,7 @@ func (o *Obj) FirstMap() (*Map, error) {
 // NextMap returns the successive maps given the first map.
 // Returns nil, no error at the end of the list.
 func (m *Map) NextMap() (*Map, error) {
-	bpfMap, err := C.bpf_map__next(m.bpfMap, m.bpfObj)
+	bpfMap, err := C.bpf_object__next_map(m.bpfObj, m.bpfMap)
 	if err != nil {
 		return nil, fmt.Errorf("error getting next map %w", err)
 	}
@@ -164,7 +167,7 @@ func DetachClassifier(ifindex, handle, pref int, ingress bool) error {
 }
 
 // AttachClassifier return the program id and pref and handle of the qdisc
-func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, int, error) {
+func (o *Obj) AttachClassifier(secName, ifName string, ingress bool, prio int) (int, int, int, error) {
 	cSecName := C.CString(secName)
 	cIfName := C.CString(ifName)
 	defer C.free(unsafe.Pointer(cSecName))
@@ -174,7 +177,7 @@ func (o *Obj) AttachClassifier(secName, ifName string, ingress bool) (int, int, 
 		return -1, -1, -1, err
 	}
 
-	ret, err := C.bpf_tc_program_attach(o.obj, cSecName, C.int(ifIndex), C.bool(ingress))
+	ret, err := C.bpf_tc_program_attach(o.obj, cSecName, C.int(ifIndex), C.bool(ingress), C.int(prio))
 	if err != nil {
 		return -1, -1, -1, fmt.Errorf("error attaching tc program %w", err)
 	}
@@ -260,8 +263,9 @@ func DetachXDP(ifName string, mode uint) error {
 		return err
 	}
 
-	_, err = C.bpf_set_link_xdp_fd(C.int(ifIndex), -1, C.uint(mode))
-	if err != nil {
+	errno := C.bpf_xdp_detach(C.int(ifIndex), C.uint(mode), nil)
+	if errno != 0 {
+		err := syscall.Errno(errno)
 		return fmt.Errorf("failed to detach xdp program. interface %s: %w", ifName, err)
 	}
 
@@ -373,71 +377,98 @@ func (o *Obj) AttachCGroup(cgroup, progName string) (*Link, error) {
 
 const (
 	// Set when IPv6 is enabled to configure bpf dataplane accordingly
-	GlobalsIPv6Enabled      uint32 = C.CALI_GLOBALS_IPV6_ENABLED
 	GlobalsRPFOptionEnabled uint32 = C.CALI_GLOBALS_RPF_OPTION_ENABLED
 	GlobalsRPFOptionStrict  uint32 = C.CALI_GLOBALS_RPF_OPTION_STRICT
 	GlobalsNoDSRCidrs       uint32 = C.CALI_GLOBALS_NO_DSR_CIDRS
+	GlobalsLoUDPOnly        uint32 = C.CALI_GLOBALS_LO_UDP_ONLY
+	GlobalsRedirectPeer     uint32 = C.CALI_GLOBALS_REDIRECT_PEER
 )
 
-func TcSetGlobals(
-	m *Map,
-	globalData *TcGlobalData,
-) error {
-
-	cName := C.CString(globalData.IfaceName)
+func (t *TcGlobalData) Set(m *Map) error {
+	cName := C.CString(t.IfaceName)
 	defer C.free(unsafe.Pointer(cName))
 
-	cJumps := make([]C.uint, len(globalData.Jumps))
+	cJumps := make([]C.uint, len(t.Jumps))
 
-	for i, v := range globalData.Jumps {
+	for i, v := range t.Jumps {
 		cJumps[i] = C.uint(v)
+	}
+
+	cJumpsV6 := make([]C.uint, len(t.JumpsV6))
+
+	for i, v := range t.JumpsV6 {
+		cJumpsV6[i] = C.uint(v)
 	}
 
 	_, err := C.bpf_tc_set_globals(m.bpfMap,
 		cName,
-		C.uint(globalData.HostIP),
-		C.uint(globalData.IntfIP),
-		C.uint(globalData.ExtToSvcMark),
-		C.ushort(globalData.Tmtu),
-		C.ushort(globalData.VxlanPort),
-		C.ushort(globalData.PSNatStart),
-		C.ushort(globalData.PSNatLen),
-		C.uint(globalData.HostTunnelIP),
-		C.uint(globalData.Flags),
-		C.ushort(globalData.WgPort),
-		C.uint(globalData.NatIn),
-		C.uint(globalData.NatOut),
-		C.uint(globalData.LogFilterJmp),
+		(*C.char)(unsafe.Pointer(&t.HostIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.IntfIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.HostIPv6[0])),
+		(*C.char)(unsafe.Pointer(&t.IntfIPv6[0])),
+		C.uint(t.ExtToSvcMark),
+		C.ushort(t.Tmtu),
+		C.ushort(t.VxlanPort),
+		C.ushort(t.PSNatStart),
+		C.ushort(t.PSNatLen),
+		(*C.char)(unsafe.Pointer(&t.HostTunnelIPv4[0])),
+		(*C.char)(unsafe.Pointer(&t.HostTunnelIPv6[0])),
+		C.uint(t.Flags),
+		C.ushort(t.WgPort),
+		C.ushort(t.Wg6Port),
+		C.ushort(t.Profiling),
+		C.uint(t.NatIn),
+		C.uint(t.NatOut),
+		C.uint(t.LogFilterJmp),
 		&cJumps[0], // it is safe because we hold the reference here until we return.
+		&cJumpsV6[0],
 	)
 
 	return err
 }
 
-func CTLBSetGlobals(m *Map, udpNotSeen time.Duration, excludeUDP bool) error {
-	udpNotSeen /= time.Second // Convert to seconds
-	_, err := C.bpf_ctlb_set_globals(m.bpfMap, C.uint(udpNotSeen), C.bool(excludeUDP))
+func (c *CTCleanupGlobalData) Set(m *Map) error {
+	_, err := C.bpf_ct_cleanup_set_globals(
+		m.bpfMap,
+		C.uint64_t(c.CreationGracePeriod.Nanoseconds()),
+
+		C.uint64_t(c.TCPSynSent.Nanoseconds()),
+		C.uint64_t(c.TCPEstablished.Nanoseconds()),
+		C.uint64_t(c.TCPFinsSeen.Nanoseconds()),
+		C.uint64_t(c.TCPResetSeen.Nanoseconds()),
+
+		C.uint64_t(c.UDPTimeout.Nanoseconds()),
+		C.uint64_t(c.GenericTimeout.Nanoseconds()),
+		C.uint64_t(c.ICMPTimeout.Nanoseconds()),
+	)
+	return err
+}
+
+func (c *CTLBGlobalData) Set(m *Map) error {
+	udpNotSeen := c.UDPNotSeen / time.Second // Convert to seconds
+	_, err := C.bpf_ctlb_set_globals(m.bpfMap, C.uint(udpNotSeen), C.bool(c.ExcludeUDP))
 
 	return err
 }
 
-func XDPSetGlobals(
-	m *Map,
-	globalData *XDPGlobalData,
-) error {
-
-	cName := C.CString(globalData.IfaceName)
+func (x *XDPGlobalData) Set(m *Map) error {
+	cName := C.CString(x.IfaceName)
 	defer C.free(unsafe.Pointer(cName))
 
-	cJumps := make([]C.uint, len(globalData.Jumps))
+	cJumps := make([]C.uint, len(x.Jumps))
+	cJumpsV6 := make([]C.uint, len(x.Jumps))
 
-	for i, v := range globalData.Jumps {
+	for i, v := range x.Jumps {
 		cJumps[i] = C.uint(v)
 	}
 
+	for i, v := range x.JumpsV6 {
+		cJumpsV6[i] = C.uint(v)
+	}
 	_, err := C.bpf_xdp_set_globals(m.bpfMap,
 		cName,
 		&cJumps[0],
+		&cJumpsV6[0],
 	)
 
 	return err

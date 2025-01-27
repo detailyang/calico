@@ -30,22 +30,26 @@ import (
 	"github.com/projectcalico/calico/felix/bpf/jump"
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/bpf/nat"
+	"github.com/projectcalico/calico/felix/bpf/profiling"
 	"github.com/projectcalico/calico/felix/bpf/routes"
 	"github.com/projectcalico/calico/felix/bpf/state"
 )
 
-type Maps struct {
-	IpsetsMap       maps.Map
+type IPMaps struct {
+	IpsetsMap    maps.Map
+	ArpMap       maps.Map
+	FailsafesMap maps.Map
+	FrontendMap  maps.Map
+	BackendMap   maps.Map
+	AffinityMap  maps.Map
+	RouteMap     maps.Map
+	CtMap        maps.Map
+	SrMsgMap     maps.Map
+	CtNatsMap    maps.Map
+}
+
+type CommonMaps struct {
 	StateMap        maps.Map
-	ArpMap          maps.Map
-	FailsafesMap    maps.Map
-	FrontendMap     maps.Map
-	BackendMap      maps.Map
-	AffinityMap     maps.Map
-	RouteMap        maps.Map
-	CtMap           maps.Map
-	SrMsgMap        maps.Map
-	CtNatsMap       maps.Map
 	IfStateMap      maps.Map
 	RuleCountersMap maps.Map
 	CountersMap     maps.Map
@@ -53,91 +57,81 @@ type Maps struct {
 	JumpMap         maps.MapWithDeleteIfExists
 	XDPProgramsMap  maps.Map
 	XDPJumpMap      maps.MapWithDeleteIfExists
+	ProfilingMap    maps.Map
+}
+
+type Maps struct {
+	CommonMaps *CommonMaps
+	V4         *IPMaps
+	V6         *IPMaps
 }
 
 func (m *Maps) Destroy() {
-	mps := []maps.Map{
-		m.IpsetsMap,
-		m.StateMap,
-		m.ArpMap,
-		m.FailsafesMap,
-		m.FrontendMap,
-		m.BackendMap,
-		m.AffinityMap,
-		m.RouteMap,
-		m.CtMap,
-		m.SrMsgMap,
-		m.CtNatsMap,
-		m.ProgramsMap,
-		m.JumpMap,
-		m.XDPProgramsMap,
-		m.XDPJumpMap,
+	mps := []maps.Map{}
+	mps = append(mps, m.CommonMaps.slice()...)
+	mps = append(mps, m.V4.slice()...)
+	if m.V6 != nil {
+		mps = append(mps, m.V6.slice()...)
 	}
-
 	for _, m := range mps {
 		os.Remove(m.(pinnedMap).Path())
 		m.(pinnedMap).Close()
 	}
 }
 
-func CreateBPFMaps() (*Maps, error) {
-	mps := []maps.Map{}
+func getCommonMaps() *CommonMaps {
+	return &CommonMaps{
+		StateMap:        state.Map(),
+		IfStateMap:      ifstate.Map(),
+		RuleCountersMap: counters.PolicyMap(),
+		CountersMap:     counters.Map(),
+		ProgramsMap:     hook.NewProgramsMap(),
+		JumpMap:         jump.Map().(maps.MapWithDeleteIfExists),
+		XDPProgramsMap:  hook.NewXDPProgramsMap(),
+		XDPJumpMap:      jump.XDPMap().(maps.MapWithDeleteIfExists),
+		ProfilingMap:    profiling.Map(),
+	}
+}
+
+func getIPMaps(ipFamily int) *IPMaps {
+	getmap := func(v4, v6 func() maps.Map) maps.Map {
+		if ipFamily == 4 {
+			return v4()
+		}
+		return v6()
+	}
+
+	getmapWithExistsCheck := func(v4, v6 func() maps.MapWithExistsCheck) maps.MapWithExistsCheck {
+		if ipFamily == 4 {
+			return v4()
+		}
+		return v6()
+	}
+
+	return &IPMaps{
+		IpsetsMap:    getmap(ipsets.Map, ipsets.MapV6),
+		ArpMap:       getmap(arp.Map, arp.MapV6),
+		FailsafesMap: getmap(failsafes.Map, failsafes.MapV6),
+		FrontendMap:  getmapWithExistsCheck(nat.FrontendMap, nat.FrontendMapV6),
+		BackendMap:   getmapWithExistsCheck(nat.BackendMap, nat.BackendMapV6),
+		AffinityMap:  getmap(nat.AffinityMap, nat.AffinityMapV6),
+		RouteMap:     getmap(routes.Map, routes.MapV6),
+		CtMap:        getmap(conntrack.Map, conntrack.MapV6),
+		SrMsgMap:     getmap(nat.SendRecvMsgMap, nat.SendRecvMsgMapV6),
+		CtNatsMap:    getmap(nat.AllNATsMsgMap, nat.AllNATsMsgMapV6),
+	}
+}
+
+func CreateBPFMaps(ipV6Enabled bool) (*Maps, error) {
 	ret := new(Maps)
 
-	ret.IpsetsMap = ipsets.Map()
-	mps = append(mps, ret.IpsetsMap)
+	ret.CommonMaps = getCommonMaps()
+	ret.V4 = getIPMaps(4)
+	if ipV6Enabled {
+		ret.V6 = getIPMaps(6)
+	}
 
-	ret.StateMap = state.Map()
-	mps = append(mps, ret.StateMap)
-
-	ret.ArpMap = arp.Map()
-	mps = append(mps, ret.ArpMap)
-
-	ret.FailsafesMap = failsafes.Map()
-	mps = append(mps, ret.FailsafesMap)
-
-	ret.FrontendMap = nat.FrontendMap()
-	mps = append(mps, ret.FrontendMap)
-
-	ret.BackendMap = nat.BackendMap()
-	mps = append(mps, ret.BackendMap)
-
-	ret.AffinityMap = nat.AffinityMap()
-	mps = append(mps, ret.AffinityMap)
-
-	ret.RouteMap = routes.Map()
-	mps = append(mps, ret.RouteMap)
-
-	ret.CtMap = conntrack.Map()
-	mps = append(mps, ret.CtMap)
-
-	ret.SrMsgMap = nat.SendRecvMsgMap()
-	mps = append(mps, ret.SrMsgMap)
-
-	ret.CtNatsMap = nat.AllNATsMsgMap()
-	mps = append(mps, ret.CtNatsMap)
-
-	ret.IfStateMap = ifstate.Map()
-	mps = append(mps, ret.IfStateMap)
-
-	ret.RuleCountersMap = counters.PolicyMap()
-	mps = append(mps, ret.RuleCountersMap)
-
-	ret.CountersMap = counters.Map()
-	mps = append(mps, ret.CountersMap)
-
-	ret.ProgramsMap = hook.NewProgramsMap()
-	mps = append(mps, ret.ProgramsMap)
-
-	ret.JumpMap = jump.Map().(maps.MapWithDeleteIfExists)
-	mps = append(mps, ret.JumpMap)
-
-	ret.XDPProgramsMap = hook.NewXDPProgramsMap()
-	mps = append(mps, ret.XDPProgramsMap)
-
-	ret.XDPJumpMap = jump.XDPMap().(maps.MapWithDeleteIfExists)
-	mps = append(mps, ret.XDPJumpMap)
-
+	mps := ret.slice()
 	for i, bpfMap := range mps {
 		err := bpfMap.EnsureExists()
 		if err != nil {
@@ -153,6 +147,47 @@ func CreateBPFMaps() (*Maps, error) {
 	}
 
 	return ret, nil
+}
+
+func (m *Maps) slice() []maps.Map {
+	mps := []maps.Map{}
+	mps = append(mps, m.CommonMaps.slice()...)
+	if m.V4 != nil {
+		mps = append(mps, m.V4.slice()...)
+	}
+	if m.V6 != nil {
+		mps = append(mps, m.V6.slice()...)
+	}
+	return mps
+}
+
+func (c *CommonMaps) slice() []maps.Map {
+	return []maps.Map{
+		c.StateMap,
+		c.IfStateMap,
+		c.RuleCountersMap,
+		c.CountersMap,
+		c.ProgramsMap,
+		c.JumpMap,
+		c.XDPProgramsMap,
+		c.XDPJumpMap,
+		c.ProfilingMap,
+	}
+}
+
+func (i *IPMaps) slice() []maps.Map {
+	return []maps.Map{
+		i.IpsetsMap,
+		i.ArpMap,
+		i.FailsafesMap,
+		i.FrontendMap,
+		i.BackendMap,
+		i.AffinityMap,
+		i.RouteMap,
+		i.CtMap,
+		i.SrMsgMap,
+		i.CtNatsMap,
+	}
 }
 
 type pinnedMap interface {

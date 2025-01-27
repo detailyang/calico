@@ -29,7 +29,6 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/iptables/cmdshim"
-
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
 )
 
@@ -66,6 +65,7 @@ type MockDataplane struct {
 	CmdNames                       []string
 	FailNextRestore                bool
 	FailAllRestores                bool
+	OnPreSave                      func()
 	OnPreRestore                   func()
 	FailNextSaveRead               bool
 	FailNextSaveStdoutPipe         bool
@@ -337,7 +337,7 @@ func (d *restoreCmd) Run() error {
 			rest := strings.Join(parts[3:], " ")
 			ruleIdx := ruleNum - 1 // 0-indexed array index of rule.
 			chain := chains[chainName]
-			Expect(len(chain)).To(BeNumerically(">", ruleIdx), "Replace of non-existent rule")
+			Expect(len(chain)).To(BeNumerically(">", ruleIdx), "Replace of nonexistent rule")
 			chain[ruleIdx] = rest
 			d.Dataplane.ChainMods.Add(chainMod{name: chainName, ruleNum: ruleNum})
 		case "-D", "--delete":
@@ -350,7 +350,7 @@ func (d *restoreCmd) Run() error {
 
 				ruleIdx := ruleNum - 1 // 0-indexed array index of rule.
 				chain := chains[chainName]
-				Expect(len(chain)).To(BeNumerically(">", ruleIdx), "Delete of non-existent rule")
+				Expect(len(chain)).To(BeNumerically(">", ruleIdx), "Delete of nonexistent rule")
 
 				for i := ruleIdx; i < len(chain)-1; i++ {
 					chain[i] = chain[i+1]
@@ -375,7 +375,7 @@ func (d *restoreCmd) Run() error {
 					newChain = append(newChain, chain[i])
 				}
 
-				Expect(found).To(BeTrue(), "Delete of non-existent rule")
+				Expect(found).To(BeTrue(), "Delete of nonexistent rule")
 				chains[chainName] = newChain
 				d.Dataplane.ChainMods.Add(chainMod{name: chainName, ruleNum: i})
 
@@ -431,6 +431,11 @@ func (d *saveCmd) Start() error {
 	if d.Dataplane.FailNextStart {
 		d.Dataplane.FailNextStart = false
 		return errors.New("dummy start failure")
+	}
+	if d.Dataplane.OnPreSave != nil {
+		log.Warn("OnPreSave set, calling it")
+		d.Dataplane.OnPreSave()
+		d.Dataplane.OnPreSave = nil
 	}
 	return nil
 }
